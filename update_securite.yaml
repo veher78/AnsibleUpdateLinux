@@ -2,18 +2,21 @@
   hosts: all
   become: yes
   tasks:
-    - name: Configure unattended-upgrades to allow only security updates
-      copy:
-        dest: /etc/apt/apt.conf.d/50unattended-upgrades
-        content: |
-        Unattended-Upgrade::Allowed-Origins {
-            "${distro_id}:${distro_codename}-security";
-          };
-          Unattended-Upgrade::Automatic-Reboot "false";
-      when: ansible_os_family == "Debian"
-    - name: Mettre à jour uniquement les paquets de sécurité (RHEL/CentOS)
-      yum:
-        name: '*'
-        security: yes
-        state: latest
-      when: ansible_os_family == "RedHat"
+- name: Ensure unattended-upgrades is installed
+  apt:
+    name: unattended-upgrades
+    state: present
+
+- name: Configure unattended-upgrades to allow only security updates
+  copy:
+    dest: /etc/apt/apt.conf.d/50unattended-upgrades
+    content: |
+      Unattended-Upgrade::Allowed-Origins {
+        "${distro_id}:${distro_codename}-security";
+      };
+      Unattended-Upgrade::Automatic-Reboot "false";
+  when: ansible_os_family == "Debian"
+
+- name: Run unattended-upgrades
+  command: unattended-upgrades -d
+  when: ansible_os_family == "Debian"
