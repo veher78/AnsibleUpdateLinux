@@ -2,12 +2,15 @@
   hosts: all
   become: yes
   tasks:
-    - name: Mettre à jour uniquement les paquets de sécurité (Debian/Ubuntu)
-      apt:
-        upgrade: security
-        update_cache: yes
-        autoclean: yes
-      when: ansible_os_family == "Debian"
+  - name: Configure unattended-upgrades to allow only security updates
+    copy:
+      dest: /etc/apt/apt.conf.d/50unattended-upgrades
+      content: |
+        Unattended-Upgrade::Allowed-Origins {
+          "${distro_id}:${distro_codename}-security";
+        };
+        Unattended-Upgrade::Automatic-Reboot "false";
+    when: ansible_os_family == "Debian"
 
     - name: Mettre à jour uniquement les paquets de sécurité (RHEL/CentOS)
       yum:
