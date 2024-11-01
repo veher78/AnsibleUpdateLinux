@@ -20,3 +20,13 @@
     - name: Run unattended-upgrades
       command: unattended-upgrades -d
       when: ansible_os_family == "Debian"
+
+    - name: Check if reboot is required
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot the server if needed
+      reboot:
+        msg: "Rebooting after security updates"
+      when: reboot_required.stat.exists
