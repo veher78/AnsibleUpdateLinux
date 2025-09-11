@@ -1,4 +1,4 @@
-- name: Mettre à jour les paquets de sécurité
+- name: Configure unattended-upgrades for security updates
   hosts: all
   become: yes
   tasks:
@@ -7,38 +7,14 @@
         name: unattended-upgrades
         state: present
 
-    - name: Configure unattended-upgrades to allow only security updates
+    - name: Configure unattended-upgrades
       copy:
         dest: /etc/apt/apt.conf.d/50unattended-upgrades
         content: |
           Unattended-Upgrade::Allowed-Origins {
-            "{{ ansible_facts['distribution'] }}:{{ ansible_facts['distribution_release'] }}-security";
+            "${distro_id}:${distro_codename}-security";
           };
           Unattended-Upgrade::Automatic-Reboot "false";
-      when: ansible_facts['os_family'] == "Debian"
-
-    - name: Validate apt sources
-      command: cat /etc/apt/sources.list
-      register: apt_sources
-      changed_when: false
-
-    - name: Run unattended-upgrades
-      command: unattended-upgrades -d
-      register: upgrade_output
-      changed_when: false
-      when: ansible_facts['os_family'] == "Debian"
-
-    - name: Log upgrade output
-      copy:
-        dest: /var/log/unattended-upgrades-ansible.log
-        content: "{{ upgrade_output.stdout }}"
-
-    - name: Check if reboot is required
-      stat:
-        path: /var/run/reboot-required
-      register: reboot_required
-
-    - name: Reboot the server if needed
-      reboot:
-        msg: "Rebooting after security updates"
-      when: reboot_required.stat.exists
+      vars:
+        distro_id: "{{ ansible_facts['distribution'] }}"
+        distro_codename: "{{ ansible_facts['distribution_release'] }}"
