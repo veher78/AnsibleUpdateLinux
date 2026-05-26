@@ -1,0 +1,152 @@
+---
+- name: Rolling Proxmox maintenance
+  hosts: proxmox
+  serial: 1
+  become: true
+
+  vars:
+    reboot_required_file: /var/run/reboot-required
+
+  pre_tasks:
+
+    - name: Check cluster quorum
+      shell: pvecm status
+      register: quorum_status
+      changed_when: false
+
+    - name: Ensure cluster has quorum
+      fail:
+        msg: "Cluster quorum not healthy"
+      when: "'Quorate: Yes' not in quorum_status.stdout"
+
+  tasks:
+
+    ########################################################
+    # UPDATE NODE
+    ########################################################
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Dist upgrade
+      apt:
+        upgrade: dist
+        autoremove: yes
+        autoclean: yes
+      register: upgrade_result
+
+    ########################################################
+    # CHECK REBOOT
+    ########################################################
+
+    - name: Check reboot required
+      stat:
+        path: "{{ reboot_required_file }}"
+      register: reboot_required
+
+    - name: Get current node name
+      command: hostname
+      register: current_node
+      changed_when: false
+
+    ########################################################
+    # HANDLE NON MIGRATABLE VMS
+    ########################################################
+
+    - name: Shutdown non migratable VMs
+      shell: qm shutdown {{ item }}
+      loop: "{{ non_migratable_vms[current_node.stdout] | default([]) }}"
+      when: reboot_required.stat.exists
+
+    - name: Wait for VMs shutdown
+      shell: qm status {{ item }}
+      register: vm_status
+      until: "'stopped' in vm_status.stdout"
+      retries: 30
+      delay: 10
+      loop: "{{ non_migratable_vms[current_node.stdout] | default([]) }}"
+      when: reboot_required.stat.exists
+
+    ########################################################
+    # MIGRATE VMS
+    ########################################################
+
+    - name: Get running VMs
+      shell: qm list | awk 'NR>1 {print $1}'
+      register: vm_list
+      changed_when: false
+      when: reboot_required.stat.exists
+
+    - name: Migrate VMs
+      shell: >
+        qm migrate {{ item }}
+        {{
+          (groups['proxmox']
+          | difference([inventory_hostname])
+          | first)
+        }}
+        --online
+      loop: "{{ vm_list.stdout_lines }}"
+      when:
+        - reboot_required.stat.exists
+        - item not in (non_migratable_vms[current_node.stdout] | default([]) | map('string') | list)
+
+    ########################################################
+    # MIGRATE LXC
+    ########################################################
+
+    - name: Get containers
+      shell: pct list | awk 'NR>1 {print $1}'
+      register: ct_list
+      changed_when: false
+      when: reboot_required.stat.exists
+
+    - name: Migrate containers
+      shell: >
+        pct migrate {{ item }}
+        {{
+          (groups['proxmox']
+          | difference([inventory_hostname])
+          | first)
+        }}
+      loop: "{{ ct_list.stdout_lines }}"
+      when: reboot_required.stat.exists
+
+    ########################################################
+    # REBOOT
+    ########################################################
+
+    - name: Reboot node
+      reboot:
+        reboot_timeout: 3600
+      when: reboot_required.stat.exists
+
+    ########################################################
+    # WAIT CLUSTER HEALTH
+    ########################################################
+
+    - name: Wait for pve services
+      shell: systemctl is-active pveproxy
+      register: pveproxy
+      until: pveproxy.stdout == "active"
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Ensure cluster healthy again
+      shell: pvecm status
+      register: post_quorum
+      until: "'Quorate: Yes' in post_quorum.stdout"
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    ########################################################
+    # RESTART PINNED VMS
+    ########################################################
+
+    - name: Restart non migratable VMs
+      shell: qm start {{ item }}
+      loop: "{{ non_migratable_vms[current_node.stdout] | default([]) }}"
+      when: reboot_required.stat.exists
