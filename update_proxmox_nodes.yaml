@@ -189,7 +189,7 @@
     # Step 4-B : Power off non-migratable VMs on this node
     # ------------------------------------------------------------------
     - name: "4-B | Power off non-migratable VMs"
-      ansible.builtin.command: "qm stop {{ item }}"
+      ansible.builtin.command: "qm shutdown {{ item }}"
       loop: "{{ non_migratable_vms[ansible_host] | default([]) }}"
       register: stop_result
       changed_when: true
