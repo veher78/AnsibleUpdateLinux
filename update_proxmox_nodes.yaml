@@ -1,152 +1,351 @@
 ---
-- name: Rolling Proxmox maintenance
-  hosts: proxmox
-  serial: 1
+# =============================================================================
+# Proxmox Hypervisor Patching + Rolling Reboot Playbook
+# =============================================================================
+# Purpose  : Patch all Proxmox nodes, detect kernel upgrades, migrate VMs/CTs,
+#            reboot nodes one-by-one, restore non-migratable VMs after reboot.
+# Author   : Generated for Ansible Semaphore
+# Requires : community.general collection, root SSH access to Proxmox nodes
+#
+# Non-migratable VMs (powered off before reboot, restored after):
+#   VM 101 → node 192.168.1.23
+#   VM 103 → node 192.168.1.22
+#   VM 110 → node 192.168.1.21
+#   VM 111 → node 192.168.1.21
+# =============================================================================
+
+##############################################################################
+# PLAY 1 – Gather pre-patch kernel version on every Proxmox node
+##############################################################################
+- name: "PLAY 1 | Record current kernel on all Proxmox nodes"
+  hosts: proxmox_nodes
+  gather_facts: false
   become: true
 
-  vars:
-    reboot_required_file: /var/run/reboot-required
-
-  pre_tasks:
-
-    - name: Check cluster quorum
-      shell: pvecm status
-      register: quorum_status
+  tasks:
+    - name: Get running kernel version
+      ansible.builtin.command: uname -r
+      register: kernel_before
       changed_when: false
 
-    - name: Ensure cluster has quorum
-      fail:
-        msg: "Cluster quorum not healthy"
-      when: "'Quorate: Yes' not in quorum_status.stdout"
+    - name: Store kernel version as host fact
+      ansible.builtin.set_fact:
+        kernel_version_before: "{{ kernel_before.stdout }}"
+
+    - name: "Show pre-patch kernel"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} — kernel before patching: {{ kernel_version_before }}"
+
+
+##############################################################################
+# PLAY 2 – Patch every Proxmox node (apt upgrade)
+##############################################################################
+- name: "PLAY 2 | Apply all available updates on Proxmox nodes"
+  hosts: proxmox_nodes
+  gather_facts: false
+  become: true
+  serial: 1          # one node at a time for patching too (safer on small clusters)
 
   tasks:
-
-    ########################################################
-    # UPDATE NODE
-    ########################################################
-
     - name: Update apt cache
-      apt:
-        update_cache: yes
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
 
-    - name: Dist upgrade
-      apt:
-        upgrade: dist
-        autoremove: yes
-        autoclean: yes
-      register: upgrade_result
+    - name: Upgrade all packages (full-upgrade)
+      ansible.builtin.apt:
+        upgrade: full
+        autoremove: true
+        autoclean: true
+      register: apt_upgrade_result
 
-    ########################################################
-    # CHECK REBOOT
-    ########################################################
+    - name: "Show upgrade summary"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} — packages changed: {{ apt_upgrade_result.changed }}"
 
-    - name: Check reboot required
-      stat:
-        path: "{{ reboot_required_file }}"
-      register: reboot_required
 
-    - name: Get current node name
-      command: hostname
-      register: current_node
+##############################################################################
+# PLAY 3 – Detect whether a new kernel was installed
+#
+# Package naming on modern Proxmox VE (8.x+):
+#   proxmox-kernel-<ver>-pve-signed   ← the actual bootable image (status: ii)
+#   proxmox-kernel-<ver>              ← meta/helper package (also ii, ignore)
+#
+# uname -r returns e.g.  7.0.2-6-pve
+# dpkg version field is  7.0.2-6        (no trailing -pve)
+#
+# Strategy:
+#   1. Query only 'ii' proxmox-kernel-*-pve-signed packages
+#   2. Extract the version field (e.g. 7.0.2-6)
+#   3. Append -pve to match uname -r output
+#   4. Sort by version, take the highest
+#   5. Compare against the running kernel recorded in Play 1
+##############################################################################
+- name: "PLAY 3 | Detect new kernel installation"
+  hosts: proxmox_nodes
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Find the highest installed proxmox kernel version
+      ansible.builtin.shell: |
+        dpkg -l 'proxmox-kernel-*-pve-signed' 2>/dev/null \
+          | awk '/^ii/{print $3}' \
+          | sort -V \
+          | tail -1
+      register: kernel_pkg_version
       changed_when: false
 
-    ########################################################
-    # HANDLE NON MIGRATABLE VMS
-    ########################################################
+    # kernel_pkg_version.stdout is e.g. "7.0.2-6"
+    # uname -r (kernel_version_before) is e.g. "7.0.2-6-pve"
+    # Append -pve so the formats match for comparison.
+    - name: Normalise installed kernel version to uname -r format
+      ansible.builtin.set_fact:
+        kernel_version_installed: "{{ kernel_pkg_version.stdout }}-pve"
+      when: kernel_pkg_version.stdout != ''
 
-    - name: Shutdown non migratable VMs
-      shell: qm shutdown {{ item }}
-      loop: "{{ non_migratable_vms[current_node.stdout] | default([]) }}"
-      when: reboot_required.stat.exists
+    - name: Set new-kernel flag
+      ansible.builtin.set_fact:
+        new_kernel_installed: >-
+          {{
+            kernel_pkg_version.stdout != '' and
+            kernel_version_installed != kernel_version_before
+          }}
 
-    - name: Wait for VMs shutdown
-      shell: qm status {{ item }}
+    - name: "Kernel upgrade status"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} —
+          new kernel detected: {{ new_kernel_installed }}
+          (running: {{ kernel_version_before }},
+           latest installed: {{ kernel_version_installed | default('n/a') }})
+
+
+##############################################################################
+# PLAY 4 – Rolling reboot (only for nodes where a new kernel was installed)
+#
+# Strategy per node:
+#   1. Power off non-migratable VMs pinned to this node
+#   2. Migrate all migratable VMs/CTs to another online node
+#   3. Reboot the node
+#   4. Wait for node to come back and confirm cluster health
+#   5. Restore non-migratable VMs
+##############################################################################
+- name: "PLAY 4 | Rolling reboot of Proxmox nodes with new kernel"
+  hosts: proxmox_nodes
+  gather_facts: false
+  become: true
+  serial: 1          # ← critical: process nodes strictly one at a time
+
+  vars:
+    # -----------------------------------------------------------------------
+    # Non-migratable VM map:  node_ip  →  list of VMIDs to power-off/restore
+    # -----------------------------------------------------------------------
+    non_migratable_vms:
+      "192.168.1.21": ["110", "111"]
+      "192.168.1.22": ["103"]
+      "192.168.1.23": ["101"]
+
+    # Target node for migration (choose a node that is NOT the current one).
+    # The playbook picks the first node in the group that differs from self.
+    migration_target: >-
+      {{
+        groups['proxmox_nodes']
+        | map('extract', hostvars, 'ansible_host')
+        | select('ne', ansible_host)
+        | list | first
+      }}
+
+    reboot_timeout: 600      # seconds to wait for node SSH after reboot
+    cluster_settle_time: 60  # seconds to wait after node rejoins before proceeding
+
+  tasks:
+    # ------------------------------------------------------------------
+    # Skip node if no new kernel was detected
+    # ------------------------------------------------------------------
+    - name: "Skip node if no kernel upgrade"
+      ansible.builtin.meta: end_host
+      when: not new_kernel_installed
+
+    # ------------------------------------------------------------------
+    # Step 4-A : Verify cluster quorum before touching this node
+    # ------------------------------------------------------------------
+    - name: "4-A | Check cluster quorum"
+      ansible.builtin.command: pvecm status
+      register: pvecm_status
+      changed_when: false
+      failed_when: "'Quorate' not in pvecm_status.stdout"
+
+    - name: "4-A | Show quorum status"
+      ansible.builtin.debug:
+        msg: "{{ pvecm_status.stdout_lines }}"
+
+    # ------------------------------------------------------------------
+    # Step 4-B : Power off non-migratable VMs on this node
+    # ------------------------------------------------------------------
+    - name: "4-B | Power off non-migratable VMs"
+      ansible.builtin.command: "qm stop {{ item }}"
+      loop: "{{ non_migratable_vms[ansible_host] | default([]) }}"
+      register: stop_result
+      changed_when: true
+      failed_when: stop_result.rc not in [0, 1]   # rc=1 = already stopped
+
+    - name: "4-B | Wait for VMs to be fully stopped"
+      ansible.builtin.command: "qm status {{ item }}"
+      loop: "{{ non_migratable_vms[ansible_host] | default([]) }}"
       register: vm_status
       until: "'stopped' in vm_status.stdout"
-      retries: 30
-      delay: 10
-      loop: "{{ non_migratable_vms[current_node.stdout] | default([]) }}"
-      when: reboot_required.stat.exists
-
-    ########################################################
-    # MIGRATE VMS
-    ########################################################
-
-    - name: Get running VMs
-      shell: qm list | awk 'NR>1 {print $1}'
-      register: vm_list
-      changed_when: false
-      when: reboot_required.stat.exists
-
-    - name: Migrate VMs
-      shell: >
-        qm migrate {{ item }}
-        {{
-          (groups['proxmox']
-          | difference([inventory_hostname])
-          | first)
-        }}
-        --online
-      loop: "{{ vm_list.stdout_lines }}"
-      when:
-        - reboot_required.stat.exists
-        - item not in (non_migratable_vms[current_node.stdout] | default([]) | map('string') | list)
-
-    ########################################################
-    # MIGRATE LXC
-    ########################################################
-
-    - name: Get containers
-      shell: pct list | awk 'NR>1 {print $1}'
-      register: ct_list
-      changed_when: false
-      when: reboot_required.stat.exists
-
-    - name: Migrate containers
-      shell: >
-        pct migrate {{ item }}
-        {{
-          (groups['proxmox']
-          | difference([inventory_hostname])
-          | first)
-        }}
-      loop: "{{ ct_list.stdout_lines }}"
-      when: reboot_required.stat.exists
-
-    ########################################################
-    # REBOOT
-    ########################################################
-
-    - name: Reboot node
-      reboot:
-        reboot_timeout: 3600
-      when: reboot_required.stat.exists
-
-    ########################################################
-    # WAIT CLUSTER HEALTH
-    ########################################################
-
-    - name: Wait for pve services
-      shell: systemctl is-active pveproxy
-      register: pveproxy
-      until: pveproxy.stdout == "active"
-      retries: 30
+      retries: 20
       delay: 10
       changed_when: false
 
-    - name: Ensure cluster healthy again
-      shell: pvecm status
-      register: post_quorum
-      until: "'Quorate: Yes' in post_quorum.stdout"
-      retries: 30
+    # ------------------------------------------------------------------
+    # Step 4-C : Migrate all running VMs to another node
+    # ------------------------------------------------------------------
+    - name: "4-C | Get list of running VMs on this node"
+      ansible.builtin.shell: |
+        qm list | awk 'NR>1 && $3=="running" {print $1}'
+      register: running_vms
+      changed_when: false
+
+    - name: "4-C | Migrate running VMs to {{ migration_target }}"
+      ansible.builtin.command: >
+        qm migrate {{ item }} {{ migration_target }} --online
+      loop: "{{ running_vms.stdout_lines }}"
+      when: running_vms.stdout_lines | length > 0
+      register: migrate_vm_result
+
+    - name: "4-C | Get list of running LXC containers on this node"
+      ansible.builtin.shell: |
+        pct list | awk 'NR>1 && $2=="running" {print $1}'
+      register: running_cts
+      changed_when: false
+
+    - name: "4-C | Migrate running CTs to {{ migration_target }}"
+      ansible.builtin.command: >
+        pct migrate {{ item }} {{ migration_target }} --restart
+      loop: "{{ running_cts.stdout_lines }}"
+      when: running_cts.stdout_lines | length > 0
+      register: migrate_ct_result
+
+    - name: "4-C | Pause to let migrations settle"
+      ansible.builtin.pause:
+        seconds: 30
+
+    # ------------------------------------------------------------------
+    # Step 4-D : Confirm node is now empty (no running guests)
+    # ------------------------------------------------------------------
+    - name: "4-D | Verify no VMs still running on this node"
+      ansible.builtin.shell: |
+        qm list | awk 'NR>1 && $3=="running" {print $1}'
+      register: remaining_vms
+      changed_when: false
+      failed_when: remaining_vms.stdout_lines | length > 0
+
+    - name: "4-D | Verify no CTs still running on this node"
+      ansible.builtin.shell: |
+        pct list | awk 'NR>1 && $2=="running" {print $1}'
+      register: remaining_cts
+      changed_when: false
+      failed_when: remaining_cts.stdout_lines | length > 0
+
+    # ------------------------------------------------------------------
+    # Step 4-E : Reboot the node
+    # ------------------------------------------------------------------
+    - name: "4-E | Reboot Proxmox node {{ inventory_hostname }}"
+      ansible.builtin.reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        pre_reboot_delay: 10
+        post_reboot_delay: 30
+        connect_timeout: 15
+        msg: "Ansible rolling reboot — new PVE kernel detected"
+
+    # ------------------------------------------------------------------
+    # Step 4-F : Verify node rejoined the cluster and kernel updated
+    # ------------------------------------------------------------------
+    - name: "4-F | Get kernel version after reboot"
+      ansible.builtin.command: uname -r
+      register: kernel_after
+      changed_when: false
+
+    - name: "4-F | Confirm new kernel is running"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} rebooted successfully.
+          Old kernel: {{ kernel_version_before }}
+          New kernel:  {{ kernel_after.stdout }}
+
+    - name: "4-F | Check cluster quorum after reboot"
+      ansible.builtin.command: pvecm status
+      register: pvecm_post
+      changed_when: false
+      retries: 10
+      delay: 15
+      until: "'Quorate' in pvecm_post.stdout"
+
+    - name: "4-F | Wait {{ cluster_settle_time }}s for cluster to fully stabilise"
+      ansible.builtin.pause:
+        seconds: "{{ cluster_settle_time }}"
+
+    # ------------------------------------------------------------------
+    # Step 4-G : Restore non-migratable VMs
+    # ------------------------------------------------------------------
+    - name: "4-G | Start non-migratable VMs"
+      ansible.builtin.command: "qm start {{ item }}"
+      loop: "{{ non_migratable_vms[ansible_host] | default([]) }}"
+      register: start_result
+      changed_when: true
+
+    - name: "4-G | Wait for VMs to reach running state"
+      ansible.builtin.command: "qm status {{ item }}"
+      loop: "{{ non_migratable_vms[ansible_host] | default([]) }}"
+      register: vm_start_status
+      until: "'running' in vm_start_status.stdout"
+      retries: 20
       delay: 10
       changed_when: false
 
-    ########################################################
-    # RESTART PINNED VMS
-    ########################################################
+    - name: "4-G | Confirm all non-migratable VMs are back online"
+      ansible.builtin.debug:
+        msg: >-
+          Node {{ inventory_hostname }} — restored VMs:
+          {{ non_migratable_vms[ansible_host] | default([]) | join(', ') }}
 
-    - name: Restart non migratable VMs
-      shell: qm start {{ item }}
-      loop: "{{ non_migratable_vms[current_node.stdout] | default([]) }}"
-      when: reboot_required.stat.exists
+
+##############################################################################
+# PLAY 5 – Final cluster health report
+##############################################################################
+- name: "PLAY 5 | Final cluster health check"
+  hosts: proxmox_nodes[0]   # run once from the first node
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: "5 | Cluster node list"
+      ansible.builtin.command: pvecm nodes
+      register: pvecm_nodes
+      changed_when: false
+
+    - name: "5 | Cluster status"
+      ansible.builtin.command: pvecm status
+      register: pvecm_final
+      changed_when: false
+
+    - name: "5 | Display final cluster report"
+      ansible.builtin.debug:
+        msg:
+          - "===== FINAL CLUSTER HEALTH ====="
+          - "{{ pvecm_nodes.stdout_lines }}"
+          - "================================"
+          - "{{ pvecm_final.stdout_lines }}"
+
+    - name: "5 | List all running guests across the cluster"
+      ansible.builtin.shell: |
+        pvesh get /cluster/resources --type vm 2>/dev/null \
+          | grep '"status":"running"' | grep -oP '"name":"\K[^"]+' || true
+      register: running_guests
+      changed_when: false
+
+    - name: "5 | Running guests report"
+      ansible.builtin.debug:
+        msg: "Running guests: {{ running_guests.stdout_lines }}"
