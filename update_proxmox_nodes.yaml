@@ -284,9 +284,30 @@
       ansible.builtin.command: pvecm status
       register: pvecm_post
       changed_when: false
-      retries: 10
-      delay: 15
-      until: "'Quorate' in pvecm_post.stdout"
+      # failed_when: false is critical — pvecm status returns rc=2 when the node
+      # has not yet rejoined quorum (Nodes: 1, Quorate: No). Without this, Ansible
+      # treats rc=2 as a hard failure on attempt 1 and never reaches the retries.
+      failed_when: false
+      # 20 retries x 20s = up to 400s (~6.5 min) for corosync to reform quorum.
+      # Adjust retries upward if your nodes are slow to boot or your network is
+      # slow to re-establish corosync/knet connections.
+      retries: 20
+      delay: 20
+      until: >-
+        pvecm_post.rc == 0 and 'Quorate: Yes' in pvecm_post.stdout
+
+    - name: "4-F | Fail explicitly if quorum was never restored"
+      ansible.builtin.fail:
+        msg: >-
+          Cluster quorum was NOT restored after {{ 20 * 20 }}s.
+          Last pvecm output: {{ pvecm_post.stdout }}
+          Manual intervention required before proceeding to the next node.
+      when: >-
+        pvecm_post.rc != 0 or 'Quorate: Yes' not in pvecm_post.stdout
+
+    - name: "4-F | Show quorum restored"
+      ansible.builtin.debug:
+        msg: "Quorum restored on {{ inventory_hostname }} — proceeding to settle wait."
 
     - name: "4-F | Wait {{ cluster_settle_time }}s for cluster to fully stabilise"
       ansible.builtin.pause:
