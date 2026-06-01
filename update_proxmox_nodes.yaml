@@ -239,20 +239,53 @@
 
     # ------------------------------------------------------------------
     # Step 4-D : Confirm node is now empty (no running guests)
+    #
+    # Both checks use a retry loop instead of a one-shot fail, because:
+    #   - pct migrate --restart stops the CT on the source, starts it on the
+    #     target — the source-side stop can lag behind the migrate command
+    #     returning, especially for CTs with heavy memory or slow disks.
+    #   - qm migrate --online for VMs can similarly take a moment to fully
+    #     vacate the source node after the command exits.
+    #
+    # 15 retries x 20s = up to 5 minutes of patience per check.
+    # If a guest is still present after that, we fail loudly with its ID
+    # so you know exactly which guest blocked the reboot.
     # ------------------------------------------------------------------
-    - name: "4-D | Verify no VMs still running on this node"
+    - name: "4-D | Wait until no VMs remain running on this node"
       ansible.builtin.shell: |
         qm list | awk 'NR>1 && $3=="running" {print $1}'
       register: remaining_vms
       changed_when: false
-      failed_when: remaining_vms.stdout_lines | length > 0
+      failed_when: false
+      retries: 15
+      delay: 20
+      until: remaining_vms.stdout_lines | length == 0
 
-    - name: "4-D | Verify no CTs still running on this node"
+    - name: "4-D | Fail if VMs are still running after timeout"
+      ansible.builtin.fail:
+        msg: >-
+          The following VMs are still running on {{ inventory_hostname }}
+          after waiting for migration to complete: {{ remaining_vms.stdout_lines | join(', ') }}.
+          Check migration status manually with: qm list
+      when: remaining_vms.stdout_lines | length > 0
+
+    - name: "4-D | Wait until no CTs remain running on this node"
       ansible.builtin.shell: |
         pct list | awk 'NR>1 && $2=="running" {print $1}'
       register: remaining_cts
       changed_when: false
-      failed_when: remaining_cts.stdout_lines | length > 0
+      failed_when: false
+      retries: 15
+      delay: 20
+      until: remaining_cts.stdout_lines | length == 0
+
+    - name: "4-D | Fail if CTs are still running after timeout"
+      ansible.builtin.fail:
+        msg: >-
+          The following CTs are still running on {{ inventory_hostname }}
+          after waiting for migration to complete: {{ remaining_cts.stdout_lines | join(', ') }}.
+          Check migration status manually with: pct list
+      when: remaining_cts.stdout_lines | length > 0
 
     # ------------------------------------------------------------------
     # Step 4-E : Reboot the node
