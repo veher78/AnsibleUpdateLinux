@@ -318,16 +318,17 @@
       register: pvecm_post
       changed_when: false
       # failed_when: false is critical — pvecm status returns rc=2 when the node
-      # has not yet rejoined quorum (Nodes: 1, Quorate: No). Without this, Ansible
-      # treats rc=2 as a hard failure on attempt 1 and never reaches the retries.
+      # has not yet rejoined quorum. Without this, rc=2 causes a hard failure on
+      # attempt 1, bypassing the retry loop entirely.
       failed_when: false
       # 20 retries x 20s = up to 400s (~6.5 min) for corosync to reform quorum.
-      # Adjust retries upward if your nodes are slow to boot or your network is
-      # slow to re-establish corosync/knet connections.
       retries: 20
       delay: 20
+      # pvecm outputs "Quorate:          Yes" with variable whitespace.
+      # Use a regex search instead of a literal string match to be whitespace-safe.
       until: >-
-        pvecm_post.rc == 0 and 'Quorate: Yes' in pvecm_post.stdout
+        pvecm_post.rc == 0 and
+        (pvecm_post.stdout | regex_search('Quorate:\s+Yes')) is not none
 
     - name: "4-F | Fail explicitly if quorum was never restored"
       ansible.builtin.fail:
@@ -336,7 +337,8 @@
           Last pvecm output: {{ pvecm_post.stdout }}
           Manual intervention required before proceeding to the next node.
       when: >-
-        pvecm_post.rc != 0 or 'Quorate: Yes' not in pvecm_post.stdout
+        pvecm_post.rc != 0 or
+        (pvecm_post.stdout | regex_search('Quorate:\s+Yes')) is none
 
     - name: "4-F | Show quorum restored"
       ansible.builtin.debug:
