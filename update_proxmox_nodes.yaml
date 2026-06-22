@@ -595,7 +595,7 @@
 
           def pvesh(path):
               raw = subprocess.check_output(
-                  ["pvesh", "get", path, "--output-format", "json"],
+                  ["pvesh", "get", path, "--type", "vm", "--output-format", "json"],
                   stderr=subprocess.DEVNULL, text=True)
               return json.loads(raw)
 
@@ -635,7 +635,7 @@
                           neg_peers[vmid] = set()
                       neg_peers[vmid].update(p for p in member_ids if p != vmid)
 
-          cluster_vms = pvesh("/cluster/resources?type=vm")
+          cluster_vms = pvesh("/cluster/resources")
           nodes = sorted(set(v["node"] for v in cluster_vms if "node" in v))
 
           vm_info = {}
@@ -741,7 +741,7 @@
         python3 - <<'PYEOF'
         import subprocess, json
         cluster_vms = json.loads(subprocess.check_output(
-            ["pvesh", "get", "/cluster/resources", "--type", "vm", "--output-format", "json"],
+            ["pvesh", "get", "/cluster/resources", "--output-format", "json"],
             stderr=subprocess.DEVNULL, text=True))
         node_score = {}
         node_count = {}
