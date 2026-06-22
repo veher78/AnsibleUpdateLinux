@@ -207,12 +207,24 @@
     # Step 4-C : Migrate all running VMs/CTs to another node,
     #            respecting HA anti-affinity rules.
     #
-    # Strategy:
-    #   For each VM, ask Proxmox which VMs are in the same negative-affinity
-    #   group, then find out which candidate nodes already host those peers.
-    #   Pick the first candidate that is NOT already hosting a conflicting peer.
-    #   If every candidate would violate anti-affinity, fall back to the last
-    #   candidate (best-effort) and let the operator decide.
+    # Strategy (read rules.cfg directly):
+    #   Proxmox stores negative-affinity rules in /etc/pve/ha/rules.cfg.
+    #   A rule block looks like:
+    #
+    #     affinity: my-rule-name
+    #       resources vm:119,vm:120
+    #       type negative
+    #
+    #   We parse this file with awk to build a peer map: for each vmid,
+    #   which other vmids must NOT share the same node.
+    #   Then for each VM to migrate, we check which candidate nodes already
+    #   host a conflicting peer (via pvesh cluster/resources), and skip those.
+    #   First clean candidate wins; last candidate is used as best-effort
+    #   fallback with a loud WARNING if all are blocked.
+    #
+    #   Candidate order comes from migration_candidates (inventory order).
+    #   Put pve2-dell before pve1-dell in your inventory so pve2-dell is
+    #   preferred when pve3 is the node being patched.
     # ------------------------------------------------------------------
     - name: "4-C | Get list of running VMs on this node"
       ansible.builtin.shell: |
@@ -220,108 +232,105 @@
       register: running_vms
       changed_when: false
 
-    # Fetch the full HA group config once — we parse it per-VM below.
-    - name: "4-C | Fetch HA resource config (for anti-affinity inspection)"
-      ansible.builtin.command: ha-manager config
-      register: ha_config_raw
-      changed_when: false
-      failed_when: false   # non-HA setups won't have this; we handle gracefully
-
-    # Build a JSON map: vmid -> [peer_vmids_in_same_negative_affinity_group]
-    # Uses pvesh to get the ha/groups list, then correlates members.
-    - name: "4-C | Build anti-affinity peer map"
-      ansible.builtin.shell: |
-        python3 - <<'PYEOF'
-        import subprocess, json, sys
-
-        # Get all HA groups
-        try:
-            groups_raw = subprocess.check_output(
-                ["pvesh", "get", "/cluster/ha/groups", "--output-format", "json"],
-                stderr=subprocess.DEVNULL, text=True
-            )
-            groups = json.loads(groups_raw)
-        except Exception:
-            print("{}")
-            sys.exit(0)
-
-        # Build map: vmid -> set of peer vmids sharing a negative-affinity group
-        peers = {}
-        for g in groups:
-            # nofailback with restrict means negative affinity in PVE HA
-            # PVE uses "nofailback" groups for anti-affinity; check group type
-            gid = g.get("group", "")
-            if "anti" not in gid.lower() and g.get("nofailback", 0) == 0:
-                continue
-            try:
-                detail_raw = subprocess.check_output(
-                    ["pvesh", "get", f"/cluster/ha/groups/{gid}", "--output-format", "json"],
-                    stderr=subprocess.DEVNULL, text=True
-                )
-                detail = json.loads(detail_raw)
-            except Exception:
-                continue
-            # members is like "vm:119,vm:120"
-            members_str = detail.get("members", "")
-            if not members_str:
-                continue
-            member_ids = [m.split(":")[1] for m in members_str.split(",") if ":" in m]
-            for vmid in member_ids:
-                if vmid not in peers:
-                    peers[vmid] = []
-                peers[vmid].extend([p for p in member_ids if p != vmid])
-
-        # Deduplicate
-        peers = {k: list(set(v)) for k, v in peers.items()}
-        print(json.dumps(peers))
-        PYEOF
-      register: affinity_peer_map_raw
-      changed_when: false
-      failed_when: false
-
-    - name: "4-C | Set affinity peer map fact"
-      ansible.builtin.set_fact:
-        affinity_peer_map: "{{ affinity_peer_map_raw.stdout | default('{}') | from_json }}"
-
-    # For each running VM, resolve the best migration target and migrate.
+    # For each running VM, find its negative-affinity peers from rules.cfg,
+    # determine which candidate nodes host those peers, and pick the first
+    # conflict-free candidate, then migrate.
     - name: "4-C | Migrate running VMs (anti-affinity aware)"
       ansible.builtin.shell: |
-        set -e
         VMID="{{ item }}"
         CANDIDATES="{{ migration_candidates | join(' ') }}"
-        PEERS='{{ (affinity_peer_map[item] | default([])) | join(" ") }}'
+        RULES_CFG="/etc/pve/ha/rules.cfg"
 
+        # --- Step 1: find peers of VMID from rules.cfg ---
+        # Parse all "negative" affinity rule blocks.
+        # The file lives at /etc/pve/ha/rules.cfg and looks like:
+        #
+        #   affinity: talos-workers
+        #     resources vm:119,vm:120
+        #     type negative
+        #
+        # python3 is always available on PVE nodes.
+        PEERS=""
+        if [ -f "$RULES_CFG" ]; then
+          PEERS=$(python3 - "$VMID" <<'PYEOF'
+        import sys, re
+
+        target_vmid = sys.argv[1]
+        target_sid  = f"vm:{target_vmid}"
+        rules_cfg   = "/etc/pve/ha/rules.cfg"
+        peers       = set()
+
+        try:
+            with open(rules_cfg) as f:
+                content = f.read()
+        except FileNotFoundError:
+            sys.exit(0)
+
+        # Split into blocks on lines that start without whitespace (stanza headers)
+        blocks = re.split(r'\n(?=\S)', content.strip())
+        for block in blocks:
+            lines = block.strip().splitlines()
+            if not lines or not lines[0].startswith("resource-affinity:"):
+                continue
+            resources = ""
+            is_negative = False
+            for line in lines[1:]:
+                line = line.strip()
+                if line.startswith("resources"):
+                    resources = line.split(None, 1)[1] if len(line.split()) > 1 else ""
+                if line.startswith("affinity") and "negative" in line:
+                    is_negative = True
+            if is_negative and target_sid in resources.split(","):
+                for sid in resources.split(","):
+                    sid = sid.strip()
+                    if sid != target_sid and sid.startswith("vm:"):
+                        peers.add(sid.split(":")[1])
+
+        print(" ".join(peers))
+        PYEOF
+          )
+        fi
+
+        echo "VM ${VMID}: negative-affinity peers=[${PEERS}]"
+
+        # --- Step 2: get current node of each peer ---
+        # Build a snapshot of cluster VM placements once (json)
+        CLUSTER_VMS=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null || echo "[]")
+
+        # --- Step 3: pick first candidate with no conflict ---
         chosen=""
         for node in $CANDIDATES; do
           conflict=0
           for peer in $PEERS; do
-            # Check if the peer VM currently runs on this candidate node
-            peer_node=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null \
-              | python3 -c "
+            peer_node=$(echo "$CLUSTER_VMS" | python3 -c "
         import sys,json
-        vms=json.load(sys.stdin)
-        for v in vms:
-            if str(v.get('vmid',''))==sys.argv[1]:
+        data=json.load(sys.stdin)
+        peer=sys.argv[1]
+        for v in data:
+            if str(v.get('vmid',''))==peer:
                 print(v.get('node',''))
+                break
         " "$peer" 2>/dev/null || true)
             if [ "$peer_node" = "$node" ]; then
+              echo "  Conflict: peer vm:${peer} is on ${node}, skipping"
               conflict=1
               break
             fi
           done
           if [ "$conflict" -eq 0 ]; then
             chosen="$node"
+            echo "  Selected: ${node} (no conflicts)"
             break
           fi
         done
 
-        # Fallback: use last candidate (best-effort) if all have conflicts
+        # --- Step 4: fallback if all candidates blocked ---
         if [ -z "$chosen" ]; then
           chosen=$(echo "$CANDIDATES" | awk '{print $NF}')
-          echo "WARNING: all candidates have anti-affinity conflicts for VM $VMID, falling back to $chosen" >&2
+          echo "WARNING: all candidates blocked for VM ${VMID}, forcing to ${chosen}" >&2
         fi
 
-        echo "Migrating VM $VMID -> $chosen"
+        echo "Migrating VM ${VMID} -> ${chosen}"
         qm migrate "$VMID" "$chosen" --online
       loop: "{{ running_vms.stdout_lines }}"
       when: running_vms.stdout_lines | length > 0
