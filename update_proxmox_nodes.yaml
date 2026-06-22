@@ -580,136 +580,126 @@
       - "111"
 
   tasks:
+    - name: "6 | Write rebalance script to disk"
+      ansible.builtin.copy:
+        dest: /tmp/pve_rebalance.py
+        mode: "0700"
+        content: |
+          import subprocess, json, re, sys
+
+          CPU_W     = float(sys.argv[1])
+          RAM_W     = float(sys.argv[2])
+          THRESHOLD = float(sys.argv[3])
+          PINNED    = set(sys.argv[4].split(",")) if sys.argv[4] else set()
+          RULES_CFG = "/etc/pve/ha/rules.cfg"
+
+          def pvesh(path):
+              raw = subprocess.check_output(
+                  ["pvesh", "get", path, "--output-format", "json"],
+                  stderr=subprocess.DEVNULL, text=True)
+              return json.loads(raw)
+
+          try:
+              rules_text = open(RULES_CFG).read()
+          except FileNotFoundError:
+              rules_text = ""
+
+          blocks = re.split(r'\n(?=\S)', rules_text.strip())
+          node_pinned = {}
+          neg_peers   = {}
+
+          for block in blocks:
+              lines = [l.strip() for l in block.strip().splitlines()]
+              if not lines:
+                  continue
+              header = lines[0]
+              props = {}
+              for l in lines[1:]:
+                  parts = l.split(None, 1)
+                  if len(parts) == 2:
+                      props[parts[0]] = parts[1]
+
+              if header.startswith("node-affinity:") and props.get("strict", "0") == "1":
+                  for sid in props.get("resources", "").split(","):
+                      sid = sid.strip()
+                      if sid.startswith("vm:"):
+                          vmid = sid.split(":")[1]
+                          allowed = set(n.strip() for n in props.get("nodes", "").split(","))
+                          node_pinned[vmid] = allowed
+
+              if header.startswith("resource-affinity:") and props.get("affinity") == "negative":
+                  members    = [s.strip() for s in props.get("resources", "").split(",")]
+                  member_ids = [s.split(":")[1] for s in members if s.startswith("vm:")]
+                  for vmid in member_ids:
+                      if vmid not in neg_peers:
+                          neg_peers[vmid] = set()
+                      neg_peers[vmid].update(p for p in member_ids if p != vmid)
+
+          cluster_vms = pvesh("/cluster/resources?type=vm")
+          nodes = sorted(set(v["node"] for v in cluster_vms if "node" in v))
+
+          vm_info = {}
+          for v in cluster_vms:
+              if v.get("type") != "qemu" or v.get("status") != "running":
+                  continue
+              vmid = str(v["vmid"])
+              if vmid in PINNED or vmid in node_pinned:
+                  continue
+              vm_info[vmid] = {
+                  "node":   v["node"],
+                  "cpus":   v.get("maxcpu", 1),
+                  "ram_gb": v.get("maxmem", 1073741824) / 1073741824,
+              }
+
+          def score(vm):
+              return vm["cpus"] * CPU_W + vm["ram_gb"] * RAM_W
+
+          moves    = []
+          MAX_MOVES = 20
+
+          for _ in range(MAX_MOVES):
+              node_score = {n: 0.0 for n in nodes}
+              node_vms   = {n: [] for n in nodes}
+              for vmid, info in vm_info.items():
+                  s = score(info)
+                  node_score[info["node"]] += s
+                  node_vms[info["node"]].append((vmid, s))
+
+              total = sum(node_score.values())
+              if total == 0:
+                  break
+
+              max_node = max(node_score, key=node_score.get)
+              min_node = min(node_score, key=node_score.get)
+              spread   = (node_score[max_node] - node_score[min_node]) / total
+
+              if spread < THRESHOLD:
+                  break
+
+              candidates = sorted(node_vms[max_node], key=lambda x: x[1], reverse=True)
+              moved = False
+              for vmid, _ in candidates:
+                  peers        = neg_peers.get(vmid, set())
+                  peers_on_min = [p for p in peers if vm_info.get(p, {}).get("node") == min_node]
+                  if peers_on_min:
+                      continue
+                  moves.append({"vmid": vmid, "from": max_node, "to": min_node})
+                  vm_info[vmid]["node"] = min_node
+                  moved = True
+                  break
+
+              if not moved:
+                  break
+
+          print(json.dumps(moves))
+
     - name: "6 | Compute rebalance move plan"
-      ansible.builtin.shell: |
-        python3 - <<'PYEOF'
-        import subprocess, json, re, sys
-
-        # ── tunables (injected from Ansible vars) ──────────────────────────
-        CPU_W      = {{ cpu_weight }}
-        RAM_W      = {{ ram_weight }}
-        THRESHOLD  = {{ balance_threshold }}
-        PINNED     = set({{ pinned_vmids | tojson }})
-        RULES_CFG  = "/etc/pve/ha/rules.cfg"
-
-        # ── helpers ────────────────────────────────────────────────────────
-        def pvesh(path):
-            raw = subprocess.check_output(
-                ["pvesh", "get", path, "--output-format", "json"],
-                stderr=subprocess.DEVNULL, text=True)
-            return json.loads(raw)
-
-        # ── Step 1: read rules.cfg ─────────────────────────────────────────
-        try:
-            rules_text = open(RULES_CFG).read()
-        except FileNotFoundError:
-            rules_text = ""
-
-        blocks = re.split(r'\n(?=\S)', rules_text.strip())
-
-        # node_pinned: vmid -> set of allowed nodes (strict node-affinity)
-        node_pinned = {}
-        # neg_peers:   vmid -> set of vmids that must not share a node
-        neg_peers = {}
-
-        for block in blocks:
-            lines = [l.strip() for l in block.strip().splitlines()]
-            if not lines:
-                continue
-            header = lines[0]
-            props = {}
-            for l in lines[1:]:
-                parts = l.split(None, 1)
-                if len(parts) == 2:
-                    props[parts[0]] = parts[1]
-
-            if header.startswith("node-affinity:") and props.get("strict", "0") == "1":
-                # resources is a single sid like "vm:111"
-                for sid in props.get("resources", "").split(","):
-                    sid = sid.strip()
-                    if sid.startswith("vm:"):
-                        vmid = sid.split(":")[1]
-                        allowed = set(n.strip() for n in props.get("nodes", "").split(","))
-                        node_pinned[vmid] = allowed
-
-            if header.startswith("resource-affinity:") and props.get("affinity") == "negative":
-                members = [s.strip() for s in props.get("resources", "").split(",")]
-                member_ids = [s.split(":")[1] for s in members if s.startswith("vm:")]
-                for vmid in member_ids:
-                    if vmid not in neg_peers:
-                        neg_peers[vmid] = set()
-                    neg_peers[vmid].update(p for p in member_ids if p != vmid)
-
-        # ── Step 2: collect running VMs with config ────────────────────────
-        cluster_vms = pvesh("/cluster/resources?type=vm")
-        nodes = sorted(set(v["node"] for v in cluster_vms if "node" in v))
-
-        # vm_info: vmid -> {node, cpus, ram_gb}
-        vm_info = {}
-        for v in cluster_vms:
-            if v.get("type") != "qemu":
-                continue
-            if v.get("status") != "running":
-                continue
-            vmid = str(v["vmid"])
-            if vmid in PINNED or vmid in node_pinned:
-                continue
-            vm_info[vmid] = {
-                "node":   v["node"],
-                "cpus":   v.get("maxcpu", 1),
-                "ram_gb": v.get("maxmem", 1073741824) / 1073741824,
-            }
-
-        def score(vm):
-            return vm["cpus"] * CPU_W + vm["ram_gb"] * RAM_W
-
-        # ── Step 3: iterative greedy rebalance ────────────────────────────
-        moves = []
-        MAX_MOVES = 20  # safety cap
-
-        for _ in range(MAX_MOVES):
-            # Compute node scores
-            node_score = {n: 0.0 for n in nodes}
-            node_vms   = {n: [] for n in nodes}
-            for vmid, info in vm_info.items():
-                s = score(info)
-                node_score[info["node"]] += s
-                node_vms[info["node"]].append((vmid, s))
-
-            total = sum(node_score.values())
-            if total == 0:
-                break
-
-            max_node = max(node_score, key=node_score.get)
-            min_node = min(node_score, key=node_score.get)
-            spread = (node_score[max_node] - node_score[min_node]) / total
-
-            if spread < THRESHOLD:
-                break
-
-            # Pick heaviest movable VM from max_node
-            candidates = sorted(node_vms[max_node], key=lambda x: x[1], reverse=True)
-            moved = False
-            for vmid, _ in candidates:
-                peers = neg_peers.get(vmid, set())
-                # Check that min_node doesn't already host a negative peer
-                peers_on_min = [
-                    p for p in peers
-                    if vm_info.get(p, {}).get("node") == min_node
-                ]
-                if peers_on_min:
-                    continue  # skip this VM, anti-affinity would be violated
-                # Move it
-                moves.append({"vmid": vmid, "from": max_node, "to": min_node})
-                vm_info[vmid]["node"] = min_node
-                moved = True
-                break
-
-            if not moved:
-                break  # no movable VM found, cluster is as balanced as possible
-
-        print(json.dumps(moves))
-        PYEOF
+      ansible.builtin.command: >
+        python3 /tmp/pve_rebalance.py
+        {{ cpu_weight }}
+        {{ ram_weight }}
+        {{ balance_threshold }}
+        {{ pinned_vmids | join(',') }}
       register: rebalance_plan_raw
       changed_when: false
 
@@ -750,22 +740,17 @@
       ansible.builtin.shell: |
         python3 - <<'PYEOF'
         import subprocess, json
-
         cluster_vms = json.loads(subprocess.check_output(
             ["pvesh", "get", "/cluster/resources", "--type", "vm", "--output-format", "json"],
             stderr=subprocess.DEVNULL, text=True))
-
         node_score = {}
         node_count = {}
         for v in cluster_vms:
             if v.get("type") != "qemu" or v.get("status") != "running":
                 continue
             n = v["node"]
-            cpus   = v.get("maxcpu", 1)
-            ram_gb = v.get("maxmem", 1073741824) / 1073741824
-            node_score[n] = node_score.get(n, 0) + cpus + ram_gb
+            node_score[n] = node_score.get(n, 0) + v.get("maxcpu", 1) + v.get("maxmem", 1073741824) / 1073741824
             node_count[n] = node_count.get(n, 0) + 1
-
         for n in sorted(node_score):
             print(f"  {n}: {node_count[n]} VMs, weighted score={node_score[n]:.1f}")
         PYEOF
