@@ -149,16 +149,15 @@
       "192.168.1.23": ["101"]
 
     # -----------------------------------------------------------------------
-    # migration_target MUST be the Proxmox cluster node NAME, not an IP.
-    # pct migrate / qm migrate validate against `pvecm nodes` output.
-    # inventory_hostname in this playbook IS the node name (pve-node1 etc.),
-    # so we simply reject self from the group and take the first remaining.
+    # migration_candidates: ordered list of OTHER nodes to try for migration.
+    # We exclude self; the playbook logic will pick the best candidate
+    # per-VM at runtime to respect HA anti-affinity rules.
     # -----------------------------------------------------------------------
-    migration_target: >-
+    migration_candidates: >-
       {{
         groups['proxmox_nodes']
         | reject('eq', inventory_hostname)
-        | list | first
+        | list
       }}
 
     reboot_timeout: 600      # seconds to wait for node SSH after reboot
@@ -205,7 +204,15 @@
       changed_when: false
 
     # ------------------------------------------------------------------
-    # Step 4-C : Migrate all running VMs to another node
+    # Step 4-C : Migrate all running VMs/CTs to another node,
+    #            respecting HA anti-affinity rules.
+    #
+    # Strategy:
+    #   For each VM, ask Proxmox which VMs are in the same negative-affinity
+    #   group, then find out which candidate nodes already host those peers.
+    #   Pick the first candidate that is NOT already hosting a conflicting peer.
+    #   If every candidate would violate anti-affinity, fall back to the last
+    #   candidate (best-effort) and let the operator decide.
     # ------------------------------------------------------------------
     - name: "4-C | Get list of running VMs on this node"
       ansible.builtin.shell: |
@@ -213,12 +220,120 @@
       register: running_vms
       changed_when: false
 
-    - name: "4-C | Migrate running VMs to {{ migration_target }}"
-      ansible.builtin.command: >
-        qm migrate {{ item }} {{ migration_target }} --online
+    # Fetch the full HA group config once — we parse it per-VM below.
+    - name: "4-C | Fetch HA resource config (for anti-affinity inspection)"
+      ansible.builtin.command: ha-manager config
+      register: ha_config_raw
+      changed_when: false
+      failed_when: false   # non-HA setups won't have this; we handle gracefully
+
+    # Build a JSON map: vmid -> [peer_vmids_in_same_negative_affinity_group]
+    # Uses pvesh to get the ha/groups list, then correlates members.
+    - name: "4-C | Build anti-affinity peer map"
+      ansible.builtin.shell: |
+        python3 - <<'PYEOF'
+        import subprocess, json, sys
+
+        # Get all HA groups
+        try:
+            groups_raw = subprocess.check_output(
+                ["pvesh", "get", "/cluster/ha/groups", "--output-format", "json"],
+                stderr=subprocess.DEVNULL, text=True
+            )
+            groups = json.loads(groups_raw)
+        except Exception:
+            print("{}")
+            sys.exit(0)
+
+        # Build map: vmid -> set of peer vmids sharing a negative-affinity group
+        peers = {}
+        for g in groups:
+            # nofailback with restrict means negative affinity in PVE HA
+            # PVE uses "nofailback" groups for anti-affinity; check group type
+            gid = g.get("group", "")
+            if "anti" not in gid.lower() and g.get("nofailback", 0) == 0:
+                continue
+            try:
+                detail_raw = subprocess.check_output(
+                    ["pvesh", "get", f"/cluster/ha/groups/{gid}", "--output-format", "json"],
+                    stderr=subprocess.DEVNULL, text=True
+                )
+                detail = json.loads(detail_raw)
+            except Exception:
+                continue
+            # members is like "vm:119,vm:120"
+            members_str = detail.get("members", "")
+            if not members_str:
+                continue
+            member_ids = [m.split(":")[1] for m in members_str.split(",") if ":" in m]
+            for vmid in member_ids:
+                if vmid not in peers:
+                    peers[vmid] = []
+                peers[vmid].extend([p for p in member_ids if p != vmid])
+
+        # Deduplicate
+        peers = {k: list(set(v)) for k, v in peers.items()}
+        print(json.dumps(peers))
+        PYEOF
+      register: affinity_peer_map_raw
+      changed_when: false
+      failed_when: false
+
+    - name: "4-C | Set affinity peer map fact"
+      ansible.builtin.set_fact:
+        affinity_peer_map: "{{ affinity_peer_map_raw.stdout | default('{}') | from_json }}"
+
+    # For each running VM, resolve the best migration target and migrate.
+    - name: "4-C | Migrate running VMs (anti-affinity aware)"
+      ansible.builtin.shell: |
+        set -e
+        VMID="{{ item }}"
+        CANDIDATES="{{ migration_candidates | join(' ') }}"
+        PEERS='{{ (affinity_peer_map[item] | default([])) | join(" ") }}'
+
+        chosen=""
+        for node in $CANDIDATES; do
+          conflict=0
+          for peer in $PEERS; do
+            # Check if the peer VM currently runs on this candidate node
+            peer_node=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null \
+              | python3 -c "
+        import sys,json
+        vms=json.load(sys.stdin)
+        for v in vms:
+            if str(v.get('vmid',''))==sys.argv[1]:
+                print(v.get('node',''))
+        " "$peer" 2>/dev/null || true)
+            if [ "$peer_node" = "$node" ]; then
+              conflict=1
+              break
+            fi
+          done
+          if [ "$conflict" -eq 0 ]; then
+            chosen="$node"
+            break
+          fi
+        done
+
+        # Fallback: use last candidate (best-effort) if all have conflicts
+        if [ -z "$chosen" ]; then
+          chosen=$(echo "$CANDIDATES" | awk '{print $NF}')
+          echo "WARNING: all candidates have anti-affinity conflicts for VM $VMID, falling back to $chosen" >&2
+        fi
+
+        echo "Migrating VM $VMID -> $chosen"
+        qm migrate "$VMID" "$chosen" --online
       loop: "{{ running_vms.stdout_lines }}"
       when: running_vms.stdout_lines | length > 0
       register: migrate_vm_result
+
+    - name: "4-C | Show VM migration results"
+      ansible.builtin.debug:
+        msg: "{{ item.stdout_lines | default([]) + item.stderr_lines | default([]) }}"
+      loop: "{{ migrate_vm_result.results | default([]) }}"
+      loop_control:
+        label: "VM {{ item.item }}"
+      when: migrate_vm_result.results is defined
 
     - name: "4-C | Get list of running LXC containers on this node"
       ansible.builtin.shell: |
@@ -226,9 +341,10 @@
       register: running_cts
       changed_when: false
 
-    - name: "4-C | Migrate running CTs to {{ migration_target }}"
+    # LXC containers: use first available candidate (CTs rarely have anti-affinity)
+    - name: "4-C | Migrate running CTs to {{ migration_candidates | first }}"
       ansible.builtin.command: >
-        pct migrate {{ item }} {{ migration_target }} --restart
+        pct migrate {{ item }} {{ migration_candidates | first }} --restart
       loop: "{{ running_cts.stdout_lines }}"
       when: running_cts.stdout_lines | length > 0
       register: migrate_ct_result
