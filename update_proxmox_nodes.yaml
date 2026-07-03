@@ -773,7 +773,7 @@
   tasks:
     - name: "7 | Uninstall existing sensors mod (ignore if not installed)"
       ansible.builtin.shell: |
-        bash /root/pve-mod-gui-sensors.sh uninstall
+        printf 'y\n' | timeout 30 bash /root/pve-mod-gui-sensors.sh uninstall
       register: sensors_uninstall
       failed_when: false
       changed_when: "'Uninstalling' in sensors_uninstall.stdout"
@@ -784,7 +784,7 @@
 
     - name: "7 | Re-install sensors mod"
       ansible.builtin.shell: |
-        printf 'Y\nY\nY\nc\nN\n' | bash /root/pve-mod-gui-sensors.sh install
+        printf 'Y\nY\nY\nc\nN\n' | timeout 60 bash /root/pve-mod-gui-sensors.sh install
       register: sensors_install
       failed_when: >
         sensors_install.rc != 0 and
