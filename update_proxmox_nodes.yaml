@@ -767,6 +767,7 @@
         printf 'c\ny\ny\nn\nc\nn\n' | bash /root/pve-mod-gui-sensors.sh install
       ignore_errors: false
       register: sensors_result
+      
     - debug:
       var: sensors_result.stdout_lines
 
