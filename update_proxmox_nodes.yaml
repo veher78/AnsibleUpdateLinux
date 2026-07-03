@@ -761,6 +761,9 @@
       ansible.builtin.debug:
         msg: "{{ final_summary.stdout_lines }}"
         
-    - name: Re-apply PVE sensors mod after update
-      command: bash /root/pve-mod-gui-sensors.sh install --unattended
+    - name: Re-apply PVE sensors mod (uninstall then reinstall)
+      shell: |
+        bash /root/pve-mod-gui-sensors.sh uninstall --unattended || true
+        bash /root/pve-mod-gui-sensors.sh install --unattended
+      ignore_errors: false
 
