@@ -761,13 +761,35 @@
       ansible.builtin.debug:
         msg: "{{ final_summary.stdout_lines }}"
         
-    - name: Re-apply PVE sensors mod (uninstall then reinstall)
-      shell: |
-        bash /root/pve-mod-gui-sensors.sh uninstall --unattended || true
-        printf 'c\ny\ny\nn\nc\nn\n' | bash /root/pve-mod-gui-sensors.sh install
-      ignore_errors: false
-      register: sensors_result
-      
-    - debug:
-      var: sensors_result.stdout_lines
+##############################################################################
+# PLAY 7 – Re-apply PVE sensors mod on all nodes after patching
+##############################################################################
+- name: "PLAY 7 | Re-apply PVE sensors GUI mod on all nodes"
+  hosts: proxmox_nodes
+  gather_facts: false
+  become: true
+  serial: 1
 
+  tasks:
+    - name: "7 | Uninstall existing sensors mod (ignore if not installed)"
+      ansible.builtin.shell: |
+        bash /root/pve-mod-gui-sensors.sh uninstall
+      register: sensors_uninstall
+      failed_when: false
+      changed_when: "'Uninstalling' in sensors_uninstall.stdout"
+
+    - name: "7 | Show uninstall output"
+      ansible.builtin.debug:
+        var: sensors_uninstall.stdout_lines
+
+    - name: "7 | Re-install sensors mod"
+      ansible.builtin.shell: |
+        printf 'Y\nY\nY\nc\nN\n' | bash /root/pve-mod-gui-sensors.sh install
+      register: sensors_install
+      failed_when: >
+        sensors_install.rc != 0 and
+        'already installed' not in sensors_install.stdout
+
+    - name: "7 | Show install output"
+      ansible.builtin.debug:
+        var: sensors_install.stdout_lines
