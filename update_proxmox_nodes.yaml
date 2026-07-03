@@ -764,6 +764,6 @@
     - name: Re-apply PVE sensors mod (uninstall then reinstall)
       shell: |
         bash /root/pve-mod-gui-sensors.sh uninstall --unattended || true
-        bash /root/pve-mod-gui-sensors.sh install --unattended
+        printf 'C\nY\nY\nY\nc\ny\n' | bash /root/pve-mod-gui-sensors.sh install
       ignore_errors: false
 
