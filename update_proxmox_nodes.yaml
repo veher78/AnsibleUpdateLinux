@@ -763,4 +763,4 @@
         
     - name: Re-apply PVE sensors mod after update
       command: bash /root/pve-mod-gui-sensors.sh install --unattended
-      when: "'pve-manager' in updated_packages"
+
