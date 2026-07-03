@@ -760,6 +760,7 @@
     - name: "6 | Show final load summary"
       ansible.builtin.debug:
         msg: "{{ final_summary.stdout_lines }}"
+        
     - name: Re-apply PVE sensors mod after update
-        command: bash /root/pve-mod-gui-sensors.sh install --unattended
-        when: "'pve-manager' in updated_packages"
+      command: bash /root/pve-mod-gui-sensors.sh install --unattended
+      when: "'pve-manager' in updated_packages"
