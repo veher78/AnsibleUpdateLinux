@@ -738,7 +738,11 @@
           def score(vm):
               return vm["cpus"] * CPU_W + vm["ram_gb"] * RAM_W
 
-          moves    = []
+          moves       = []
+          moved_vmids = set()   # each VM moves at most once per run — prevents
+                                 # the same guest flip-flopping back and forth
+                                 # when there isn't enough granularity among
+                                 # running VMs to hit THRESHOLD exactly.
           MAX_MOVES = 50   # was 20 — more room to fully flatten a skewed cluster
 
           for _ in range(MAX_MOVES):
@@ -763,16 +767,25 @@
               candidates = sorted(node_vms[max_node], key=lambda x: x[1], reverse=True)
               moved = False
               for vmid, _ in candidates:
+                  if vmid in moved_vmids:
+                      continue
                   peers        = neg_peers.get(vmid, set())
                   peers_on_min = [p for p in peers if vm_info.get(p, {}).get("node") == min_node]
                   if peers_on_min:
                       continue
                   moves.append({"vmid": vmid, "from": max_node, "to": min_node})
                   vm_info[vmid]["node"] = min_node
+                  moved_vmids.add(vmid)
                   moved = True
                   break
 
               if not moved:
+                  # Either every VM on the most-loaded node is pinned by
+                  # anti-affinity, or every movable VM here has already been
+                  # moved once this run. Either way, moving further would mean
+                  # re-moving an already-moved guest (oscillation) rather than
+                  # making real progress, so stop here even if spread is still
+                  # above THRESHOLD.
                   break
 
           print(json.dumps(moves))
@@ -803,6 +816,12 @@
           {% endfor %}
           {% endif %}
 
+    # qm migrate is a LOCAL command — it must run on the node that currently
+    # owns the VM (item.from), never from a fixed "coordinator" node. Without
+    # delegate_to here, every migration was issued from proxmox_nodes[0]
+    # regardless of where the VM actually lives, which fails immediately
+    # ("target is local node" when from==self, "config does not exist" when
+    # the VM isn't local to the executing node).
     - name: "6 | Execute VM migrations"
       ansible.builtin.command: >
         qm migrate {{ item.vmid }} {{ item.to }} --online
@@ -810,6 +829,7 @@
       loop_control:
         label: "VM {{ item.vmid }}: {{ item.from }} → {{ item.to }}"
       when: rebalance_moves | length > 0
+      delegate_to: "{{ item.from }}"
       register: rebalance_migrate_result
 
     - name: "6 | Pause between migrations to let cluster settle"
