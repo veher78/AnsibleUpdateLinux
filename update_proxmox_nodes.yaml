@@ -1,3 +1,75 @@
+
+Claude finished the response
+
+Ran 2 commands, created a file, read a file
+Ran 2 commands, created a file, read a file
+Both changes are in, YAML-validated:
+
+4-C now scores each conflict-free candidate by current weighted load (via /cluster/resources) and picks the lowest — same for VMs and CTs — instead of "first in inventory order." That should stop the pve1↔pve2 ping-pong; guests should now spread across all three as the reboot sequence progresses.
+Play 6 now uses balance_threshold: 0.05 (was 0.20) and MAX_MOVES = 50 (was 20), so it keeps moving VMs until the cluster is much closer to flat.
+One thing worth watching on your first run with the new logic: since 4-C's load check happens fresh per-VM (it re-queries /cluster/resources on each loop iteration), a burst of same-node migrations for VMs with no peers will correctly spread across nodes rather than all landing on one "cheapest" node — but if you have many VMs migrating in the same second the pvesh snapshot could lag slightly behind reality. Not a real risk here given your VM count, just flagging it in case you ever scale the cluster up a lot.
+
+
+Update proxmox nodes
+YAML 
+
+12:22:07 AM TASK [6 | Execute VM migrations] *********************************************** 12:22:08 AM [ERROR]: Task failed: Module failed: non-zero return code 12:22:08 AM Origin: /tmp/ansible-playbooks/repository_2_8/update_proxmox_nodes.yaml:806:7 12:22:08 AM 12:22:08 AM 804 {
+
+pasted
+
+all went fine until :
+
+
+Thought for 1m 11s
+Thought for 1m 11s
+Two separate bugs, and the second one is the nastier one:
+
+Bug 1 — qm migrate runs from the wrong node. Play 6 only runs on proxmox_nodes[0] (PVE1-dell), but qm migrate is a local command — it must be issued from the node that currently owns the VM, not from an arbitrary cluster member. That's exactly what both errors say: "target is local node" when the plan tried to migrate VM 124 to PVE1-dell while running from PVE1-dell, and "Configuration file ... does not exist" when it tried to migrate FROM PVE1-dell a VM that actually lives on pve2-dell. This was a latent bug in the original playbook too — it just never got exercised because Play 6 rarely produced real moves before we tightened the threshold.
+
+Bug 2 — the oscillation itself. With balance_threshold: 0.05 and only a couple of movable VMs (124 being the big one), the greedy algorithm can't get the two nodes within 5% of each other no matter what it does — so it keeps "fixing" the imbalance by flipping VM 124 back and forth, burning all the way up to MAX_MOVES: 50. The old 0.20 threshold masked this because it usually gave up before oscillating.
+
+Fixing both:
+
+
+Edited 2 files, ran 2 commands, read a file
+Edited 2 files, ran 2 commands, read a file
+Fixed both:
+
+delegate_to: "{{ item.from }}" on the migration task, so qm migrate actually runs from the node that owns the VM instead of always from PVE1-dell. This alone would have fixed the crash you saw.
+Each VM can now only move once per rebalance run (moved_vmids set) — if the cluster can't get under the 5% threshold with the remaining un-moved guests, the script stops instead of flip-flopping the same VM until it hits the 50-move cap.
+With only a couple of running VMs and this much RAM/CPU granularity, you may still land a bit above 5% after one run — that's expected and fine; better than churning VM 124 fifty times. If you want, next run's threshold miss will just show up as "no moves made" in the debug output rather than an error.
+
+
+Update proxmox nodes
+YAML 
+1787956304326_image.png
+indeed it's even worst , look : 
+let's focus please uniquely on RAM balancing and ignore CPU, or lower its priority 4 times less than RAM Balancing.
+Don't forget to consider the few instances that are meant to stay on the node (VM HA affinity to a node)
+
+
+Edited 5 files, viewed 4 files, ran 4 commands · 6 notes
+Edited 5 files, viewed 4 files, ran 4 commands · 6 notes
+Two fixes applied — same root-cause theme as last time (a value that was supposed to be shared but wasn't):
+
+RAM now weighted 4x over CPU (ram_weight: 4, cpu_weight: 1), in both Play 4's live migration-target selection and Play 6's rebalance scoring, so RAM dominates the decision.
+The actual bug behind "even worse": Play 6's pinned_vmids was a hand-typed list of only 4 IDs (101, 103, 110, 111), while Play 4's real pinned map has 7 (also 119, 120, 126). VM 119 — pinned to PVE1-dell — wasn't in Play 6's list, so the rebalancer was free to move it around and then Play 4 would try to manage it assuming it never left. I made Play 4's map the single source of truth (YAML anchor &non_migratable_vms_map) and had Play 6 alias it and derive pinned_vmids automatically (non_migratable_vms.values() | flatten) — so a VM added to the pinned map is protected everywhere, permanently, with no second list to keep in sync.
+One thing worth flagging honestly: this fixes the scheduling logic, but our score is still built from each VM's configured RAM allocation, not its live actual usage. If PVE1-dell's 93% is driven by the pinned VMs (110/111/119) genuinely using most of their allocated RAM, no amount of rebalancing the movable guests will bring that number down — those three simply can't leave that node. If after this run PVE1-dell is still pinned near that number, it's worth checking whether 110/111/119 collectively need more RAM than PVE1-dell physically has to spare, which is a capacity question, not a scheduling one.
+
+
+Read and edited memory
+Read and edited memory
+Let me know how this run goes once you kick it off — happy to dig further into the real-usage-vs-allocation angle if PVE1-dell is still sitting high after this.
+
+
+Update proxmox nodes
+YAML 
+
+Write a message…
+
+
+Claude is AI and can make mistakes. Please double-check responses.
+Update proxmox nodes · YAML
 ---
 # =============================================================================
 # Proxmox Hypervisor Patching + Rolling Reboot Playbook
@@ -22,8 +94,20 @@
 #   - Play 6: rebalancing is more aggressive — tighter balance_threshold and
 #     a higher move cap, so the cluster converges closer to flat instead of
 #     stopping at "close enough".
+#   - Play 6: fixed qm migrate running from a fixed coordinator node instead
+#     of the VM's actual current node (delegate_to: "{{ item.from }}"), and
+#     added a per-run "moved once" guard so a VM can't be flip-flopped back
+#     and forth when the cluster can't hit the threshold exactly.
+#   - Play 4 & Play 6: RAM is now weighted 4x higher than CPU in the load
+#     score (ram_weight: 4, cpu_weight: 1) — RAM balancing is the priority,
+#     CPU is a lightweight tiebreaker only.
+#   - Play 4 & Play 6: pinned/non-migratable VMs are now defined ONCE (the
+#     anchored non_migratable_vms map in Play 4) and aliased into Play 6,
+#     instead of Play 6 keeping its own separate, driftable copy. This fixes
+#     a real bug where VM 119 (pinned to PVE1-dell) was missing from Play 6's
+#     old hardcoded pinned list and got rebalanced away despite being pinned.
 # =============================================================================
-
+ 
 ##############################################################################
 # PLAY 1 – Gather pre-patch kernel version on every Proxmox node
 ##############################################################################
@@ -31,22 +115,22 @@
   hosts: proxmox_nodes
   gather_facts: false
   become: true
-
+ 
   tasks:
     - name: Get running kernel version
       ansible.builtin.command: uname -r
       register: kernel_before
       changed_when: false
-
+ 
     - name: Store kernel version as host fact
       ansible.builtin.set_fact:
         kernel_version_before: "{{ kernel_before.stdout }}"
-
+ 
     - name: "Show pre-patch kernel"
       ansible.builtin.debug:
         msg: "{{ inventory_hostname }} — kernel before patching: {{ kernel_version_before }}"
-
-
+ 
+ 
 ##############################################################################
 # PLAY 2 – Patch every Proxmox node (apt upgrade)
 ##############################################################################
@@ -55,25 +139,25 @@
   gather_facts: false
   become: true
   serial: 1          # one node at a time for patching too (safer on small clusters)
-
+ 
   tasks:
     - name: Update apt cache
       ansible.builtin.apt:
         update_cache: true
         cache_valid_time: 0
-
+ 
     - name: Upgrade all packages (full-upgrade)
       ansible.builtin.apt:
         upgrade: full
         autoremove: true
         autoclean: true
       register: apt_upgrade_result
-
+ 
     - name: "Show upgrade summary"
       ansible.builtin.debug:
         msg: "{{ inventory_hostname }} — packages changed: {{ apt_upgrade_result.changed }}"
-
-
+ 
+ 
 ##############################################################################
 # PLAY 3 – Detect whether a new kernel was installed
 #
@@ -95,7 +179,7 @@
   hosts: proxmox_nodes
   gather_facts: false
   become: true
-
+ 
   tasks:
     - name: Find the highest installed proxmox kernel version
       ansible.builtin.shell: |
@@ -105,7 +189,7 @@
           | tail -1
       register: kernel_pkg_version
       changed_when: false
-
+ 
     # kernel_pkg_version.stdout is e.g. "7.0.2-6"
     # uname -r (kernel_version_before) is e.g. "7.0.2-6-pve"
     # Append -pve so the formats match for comparison.
@@ -113,7 +197,7 @@
       ansible.builtin.set_fact:
         kernel_version_installed: "{{ kernel_pkg_version.stdout }}-pve"
       when: kernel_pkg_version.stdout != ''
-
+ 
     - name: Set new-kernel flag
       ansible.builtin.set_fact:
         new_kernel_installed: >-
@@ -121,7 +205,7 @@
             kernel_pkg_version.stdout != '' and
             kernel_version_installed != kernel_version_before
           }}
-
+ 
     - name: "Kernel upgrade status"
       ansible.builtin.debug:
         msg: >-
@@ -129,8 +213,8 @@
           new kernel detected: {{ new_kernel_installed }}
           (running: {{ kernel_version_before }},
            latest installed: {{ kernel_version_installed | default('n/a') }})
-
-
+ 
+ 
 ##############################################################################
 # PLAY 4 – Rolling reboot (only for nodes where a new kernel was installed)
 #
@@ -146,18 +230,27 @@
   gather_facts: false
   become: true
   serial: 1          # ← critical: process nodes strictly one at a time
-
+ 
   vars:
     # -----------------------------------------------------------------------
     # Non-migratable VM map:  node_ip  ->  list of VMIDs to power-off/restore
     # Key = ansible_host (IP) because that is how Ansible tracks the host at
     # runtime. These are used in 4-B and 4-G tasks below.
+    #
+    # Anchored (&non_migratable_vms_map) so Play 6 can alias the EXACT same
+    # map instead of keeping its own separate, driftable copy. This is the
+    # single source of truth for "VMs that must stay put" — a VM listed here
+    # is excluded from both the Play 4 migration logic (it's simply never a
+    # candidate, it gets shut down/restarted in place) and Play 6's rebalance
+    # (see pinned_vmids there). Previously Play 6 had its own hardcoded
+    # subset of these IDs that fell out of sync with this map — that's what
+    # let VM 119 get rebalanced away from PVE1-dell despite being pinned here.
     # -----------------------------------------------------------------------
-    non_migratable_vms:
+    non_migratable_vms: &non_migratable_vms_map
       "192.168.1.21": ["110", "111", "119"]
       "192.168.1.22": ["103", "120"]
       "192.168.1.23": ["101", "126"]
-
+ 
     # -----------------------------------------------------------------------
     # migration_candidates: ordered list of OTHER nodes to try for migration.
     # We exclude self. As of this revision, order here is only a TIE-BREAKER
@@ -170,16 +263,18 @@
         | reject('eq', inventory_hostname)
         | list
       }}
-
+ 
     # Weights used for load-aware target selection, matching Play 6's metric
     # so migrations during reboot and the post-patch rebalance agree on what
-    # "loaded" means.
+    # "loaded" means. RAM is the priority metric; CPU is kept only as a
+    # lightweight tiebreaker at 4x lower weight (per request — RAM balancing
+    # is what actually matters here, CPU usage across nodes was fine).
     cpu_weight: 1
-    ram_weight: 1   # per GB
-
+    ram_weight: 4   # per GB — 4x the weight of cpu_weight
+ 
     reboot_timeout: 600      # seconds to wait for node SSH after reboot
     cluster_settle_time: 60  # seconds to wait after node rejoins before proceeding
-
+ 
   tasks:
     # ------------------------------------------------------------------
     # Skip node if no new kernel was detected
@@ -187,7 +282,7 @@
     - name: "Skip node if no kernel upgrade"
       ansible.builtin.meta: end_host
       when: not new_kernel_installed
-
+ 
     # ------------------------------------------------------------------
     # Step 4-A : Verify cluster quorum before touching this node
     # ------------------------------------------------------------------
@@ -196,11 +291,11 @@
       register: pvecm_status
       changed_when: false
       failed_when: "'Quorate' not in pvecm_status.stdout"
-
+ 
     - name: "4-A | Show quorum status"
       ansible.builtin.debug:
         msg: "{{ pvecm_status.stdout_lines }}"
-
+ 
     # ------------------------------------------------------------------
     # Step 4-B : Power off non-migratable VMs on this node
     # ------------------------------------------------------------------
@@ -210,7 +305,7 @@
       register: stop_result
       changed_when: true
       failed_when: stop_result.rc not in [0, 1]   # rc=1 = already stopped
-
+ 
     - name: "4-B | Wait for VMs to be fully stopped"
       ansible.builtin.command: "qm status {{ item }}"
       loop: "{{ non_migratable_vms[ansible_host] | default([]) }}"
@@ -219,7 +314,7 @@
       retries: 20
       delay: 10
       changed_when: false
-
+ 
     # ------------------------------------------------------------------
     # Step 4-C : Migrate all running VMs/CTs to another node,
     #            respecting HA anti-affinity rules AND balancing load.
@@ -254,7 +349,7 @@
         qm list | awk 'NR>1 && $3=="running" {print $1}'
       register: running_vms
       changed_when: false
-
+ 
     - name: "4-C | Migrate running VMs (anti-affinity aware, load-balanced)"
       ansible.builtin.shell: |
         VMID="{{ item }}"
@@ -262,24 +357,24 @@
         RULES_CFG="/etc/pve/ha/rules.cfg"
         CPU_W="{{ cpu_weight }}"
         RAM_W="{{ ram_weight }}"
-
+ 
         # --- Step 1: find peers of VMID from rules.cfg ---
         PEERS=""
         if [ -f "$RULES_CFG" ]; then
           PEERS=$(python3 - "$VMID" <<'PYEOF'
         import sys, re
-
+ 
         target_vmid = sys.argv[1]
         target_sid  = f"vm:{target_vmid}"
         rules_cfg   = "/etc/pve/ha/rules.cfg"
         peers       = set()
-
+ 
         try:
             with open(rules_cfg) as f:
                 content = f.read()
         except FileNotFoundError:
             sys.exit(0)
-
+ 
         blocks = re.split(r'\n(?=\S)', content.strip())
         for block in blocks:
             lines = block.strip().splitlines()
@@ -298,17 +393,17 @@
                     sid = sid.strip()
                     if sid != target_sid and sid.startswith("vm:"):
                         peers.add(sid.split(":")[1])
-
+ 
         print(" ".join(peers))
         PYEOF
           )
         fi
-
+ 
         echo "VM ${VMID}: negative-affinity peers=[${PEERS}]"
-
+ 
         # --- Step 2: snapshot current cluster placements + running guests ---
         CLUSTER_VMS=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null || echo "[]")
-
+ 
         # --- Step 3: build list of conflict-free candidates ---
         clean_candidates=""
         for node in $CANDIDATES; do
@@ -334,7 +429,7 @@
           fi
         done
         clean_candidates=$(echo "$clean_candidates" | xargs)
-
+ 
         # --- Step 4: among conflict-free candidates, pick the LOWEST-LOADED ---
         chosen=""
         if [ -n "$clean_candidates" ]; then
@@ -344,7 +439,7 @@
         candidates = sys.argv[1].split()
         cpu_w = float(sys.argv[2])
         ram_w = float(sys.argv[3])
-
+ 
         scores = {n: 0.0 for n in candidates}
         for v in data:
             if v.get('status') != 'running':
@@ -355,7 +450,7 @@
             cpus = v.get('maxcpu', 1)
             ram_gb = v.get('maxmem', 1073741824) / 1073741824
             scores[node] += cpus * cpu_w + ram_gb * ram_w
-
+ 
         best = min(scores, key=scores.get)
         print(best, file=sys.stderr)
         print(' '.join(f'{n}={scores[n]:.1f}' for n in candidates), file=sys.stderr)
@@ -364,19 +459,19 @@
           echo "  Candidate loads: $(cat /tmp/vm_${VMID}_scores.log | tail -1)"
           echo "  Selected: ${chosen} (lowest current weighted load)"
         fi
-
+ 
         # --- Step 5: fallback if every candidate was affinity-blocked ---
         if [ -z "$chosen" ]; then
           chosen=$(echo "$CANDIDATES" | awk '{print $NF}')
           echo "WARNING: all candidates blocked by anti-affinity for VM ${VMID}, forcing to ${chosen}" >&2
         fi
-
+ 
         echo "Migrating VM ${VMID} -> ${chosen}"
         qm migrate "$VMID" "$chosen" --online
       loop: "{{ running_vms.stdout_lines }}"
       when: running_vms.stdout_lines | length > 0
       register: migrate_vm_result
-
+ 
     - name: "4-C | Show VM migration results"
       ansible.builtin.debug:
         msg: "{{ item.stdout_lines | default([]) + item.stderr_lines | default([]) }}"
@@ -384,13 +479,13 @@
       loop_control:
         label: "VM {{ item.item }}"
       when: migrate_vm_result.results is defined
-
+ 
     - name: "4-C | Get list of running LXC containers on this node"
       ansible.builtin.shell: |
         pct list | awk 'NR>1 && $2=="running" {print $1}'
       register: running_cts
       changed_when: false
-
+ 
     # LXC containers rarely carry anti-affinity rules, so we just pick the
     # least-loaded candidate directly (no conflict-filtering pass needed).
     - name: "4-C | Migrate running CTs to least-loaded candidate"
@@ -399,16 +494,16 @@
         CANDIDATES="{{ migration_candidates | join(' ') }}"
         CPU_W="{{ cpu_weight }}"
         RAM_W="{{ ram_weight }}"
-
+ 
         CLUSTER_VMS=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null || echo "[]")
-
+ 
         chosen=$(echo "$CLUSTER_VMS" | python3 -c "
         import sys, json
         data = json.load(sys.stdin)
         candidates = sys.argv[1].split()
         cpu_w = float(sys.argv[2])
         ram_w = float(sys.argv[3])
-
+ 
         scores = {n: 0.0 for n in candidates}
         for v in data:
             if v.get('status') != 'running':
@@ -419,16 +514,16 @@
             cpus = v.get('maxcpu', 1)
             ram_gb = v.get('maxmem', 1073741824) / 1073741824
             scores[node] += cpus * cpu_w + ram_gb * ram_w
-
+ 
         print(min(scores, key=scores.get))
         " "$CANDIDATES" "$CPU_W" "$RAM_W")
-
+ 
         echo "Migrating CT ${CTID} -> ${chosen} (least-loaded candidate)"
         pct migrate "$CTID" "$chosen" --restart
       loop: "{{ running_cts.stdout_lines }}"
       when: running_cts.stdout_lines | length > 0
       register: migrate_ct_result
-
+ 
     - name: "4-C | Show CT migration results"
       ansible.builtin.debug:
         msg: "{{ item.stdout_lines | default([]) + item.stderr_lines | default([]) }}"
@@ -436,11 +531,11 @@
       loop_control:
         label: "CT {{ item.item }}"
       when: migrate_ct_result.results is defined
-
+ 
     - name: "4-C | Pause to let migrations settle"
       ansible.builtin.pause:
         seconds: 30
-
+ 
     # ------------------------------------------------------------------
     # Step 4-D : Confirm node is now empty (no running guests)
     #
@@ -464,7 +559,7 @@
       retries: 15
       delay: 20
       until: remaining_vms.stdout_lines | length == 0
-
+ 
     - name: "4-D | Fail if VMs are still running after timeout"
       ansible.builtin.fail:
         msg: >-
@@ -472,7 +567,7 @@
           after waiting for migration to complete: {{ remaining_vms.stdout_lines | join(', ') }}.
           Check migration status manually with: qm list
       when: remaining_vms.stdout_lines | length > 0
-
+ 
     - name: "4-D | Wait until no CTs remain running on this node"
       ansible.builtin.shell: |
         pct list | awk 'NR>1 && $2=="running" {print $1}'
@@ -482,7 +577,7 @@
       retries: 15
       delay: 20
       until: remaining_cts.stdout_lines | length == 0
-
+ 
     - name: "4-D | Fail if CTs are still running after timeout"
       ansible.builtin.fail:
         msg: >-
@@ -490,7 +585,7 @@
           after waiting for migration to complete: {{ remaining_cts.stdout_lines | join(', ') }}.
           Check migration status manually with: pct list
       when: remaining_cts.stdout_lines | length > 0
-
+ 
     # ------------------------------------------------------------------
     # Step 4-E : Reboot the node
     # ------------------------------------------------------------------
@@ -501,7 +596,7 @@
         post_reboot_delay: 30
         connect_timeout: 15
         msg: "Ansible rolling reboot — new PVE kernel detected"
-
+ 
     # ------------------------------------------------------------------
     # Step 4-F : Verify node rejoined the cluster and kernel updated
     # ------------------------------------------------------------------
@@ -509,14 +604,14 @@
       ansible.builtin.command: uname -r
       register: kernel_after
       changed_when: false
-
+ 
     - name: "4-F | Confirm new kernel is running"
       ansible.builtin.debug:
         msg: >-
           {{ inventory_hostname }} rebooted successfully.
           Old kernel: {{ kernel_version_before }}
           New kernel:  {{ kernel_after.stdout }}
-
+ 
     - name: "4-F | Check cluster quorum after reboot"
       ansible.builtin.command: pvecm status
       register: pvecm_post
@@ -533,7 +628,7 @@
       until: >-
         pvecm_post.rc == 0 and
         (pvecm_post.stdout | regex_search('Quorate:\s+Yes')) is not none
-
+ 
     - name: "4-F | Fail explicitly if quorum was never restored"
       ansible.builtin.fail:
         msg: >-
@@ -543,15 +638,15 @@
       when: >-
         pvecm_post.rc != 0 or
         (pvecm_post.stdout | regex_search('Quorate:\s+Yes')) is none
-
+ 
     - name: "4-F | Show quorum restored"
       ansible.builtin.debug:
         msg: "Quorum restored on {{ inventory_hostname }} — proceeding to settle wait."
-
+ 
     - name: "4-F | Wait {{ cluster_settle_time }}s for cluster to fully stabilise"
       ansible.builtin.pause:
         seconds: "{{ cluster_settle_time }}"
-
+ 
     # ------------------------------------------------------------------
     # Step 4-G : Restore non-migratable VMs
     # ------------------------------------------------------------------
@@ -560,7 +655,7 @@
       loop: "{{ non_migratable_vms[ansible_host] | default([]) }}"
       register: start_result
       changed_when: true
-
+ 
     - name: "4-G | Wait for VMs to reach running state"
       ansible.builtin.command: "qm status {{ item }}"
       loop: "{{ non_migratable_vms[ansible_host] | default([]) }}"
@@ -569,14 +664,14 @@
       retries: 20
       delay: 10
       changed_when: false
-
+ 
     - name: "4-G | Confirm all non-migratable VMs are back online"
       ansible.builtin.debug:
         msg: >-
           Node {{ inventory_hostname }} — restored VMs:
           {{ non_migratable_vms[ansible_host] | default([]) | join(', ') }}
-
-
+ 
+ 
 ##############################################################################
 # PLAY 5 – Final cluster health report
 ##############################################################################
@@ -584,18 +679,18 @@
   hosts: proxmox_nodes[0]   # run once from the first node
   gather_facts: false
   become: true
-
+ 
   tasks:
     - name: "5 | Cluster node list"
       ansible.builtin.command: pvecm nodes
       register: pvecm_nodes
       changed_when: false
-
+ 
     - name: "5 | Cluster status"
       ansible.builtin.command: pvecm status
       register: pvecm_final
       changed_when: false
-
+ 
     - name: "5 | Display final cluster report"
       ansible.builtin.debug:
         msg:
@@ -603,19 +698,19 @@
           - "{{ pvecm_nodes.stdout_lines }}"
           - "================================"
           - "{{ pvecm_final.stdout_lines }}"
-
+ 
     - name: "5 | List all running guests across the cluster"
       ansible.builtin.shell: |
         pvesh get /cluster/resources --type vm 2>/dev/null \
           | grep '"status":"running"' | grep -oP '"name":"\K[^"]+' || true
       register: running_guests
       changed_when: false
-
+ 
     - name: "5 | Running guests report"
       ansible.builtin.debug:
         msg: "Running guests: {{ running_guests.stdout_lines }}"
-
-
+ 
+ 
 ##############################################################################
 # PLAY 6 – Cluster load rebalancing (CPU + RAM weighted)
 #
@@ -624,10 +719,12 @@
 # Scope:
 #   - Only considers RUNNING VMs
 #   - Excludes VMs pinned by node-affinity strict rules (rules.cfg)
-#   - Excludes VMs in the non_migratable_vms map
+#   - Excludes VMs in the non_migratable_vms map (aliased from Play 4 — see
+#     pinned_vmids below; this is the single source of truth, not a copy)
 #   - Respects resource-affinity negative rules when choosing destination
 #
 # Load metric: weighted score = (vCPUs * cpu_weight) + (RAM_GB * ram_weight)
+#   RAM is weighted 4x higher than CPU — RAM balancing is the priority here.
 # Balance threshold: stops when max_node_score - min_node_score < threshold
 #   fraction of total. TIGHTENED in this revision (0.20 -> 0.05) so the
 #   cluster converges much closer to flat instead of stopping at "good enough".
@@ -642,27 +739,33 @@
   hosts: proxmox_nodes[0]
   gather_facts: false
   become: true
-
+ 
   vars:
-    # Weights for the load score — adjust to taste
+    # Weights for the load score. RAM is the priority metric; CPU is kept
+    # only as a lightweight tiebreaker at 4x lower weight (usage was already
+    # fine across nodes — RAM is what needs balancing).
     cpu_weight: 1
-    ram_weight: 1   # per GB
-
+    ram_weight: 4   # per GB — 4x the weight of cpu_weight
+ 
     # Max spread tolerated before we stop rebalancing:
     # if (max_score - min_score) / total_score < this, cluster is balanced.
     # Tightened from 0.20 -> 0.05 for a more aggressive rebalance.
     balance_threshold: 0.05
-
+ 
     # Seconds to wait between individual VM migrations
     migrate_settle_seconds: 20
-
-    # Flat list of all pinned VMIDs (from the non_migratable_vms map in Play 4)
-    pinned_vmids:
-      - "101"
-      - "103"
-      - "110"
-      - "111"
-
+ 
+    # Same anchored map Play 4 uses for shutdown/restart-in-place — aliased
+    # here rather than duplicated, so there is exactly one place that says
+    # "this VM is pinned". pinned_vmids is derived from it automatically,
+    # so a VM added to the map is excluded from rebalancing everywhere
+    # without needing a second edit. (Previously this was a hand-maintained
+    # list that had drifted out of sync with Play 4's map — VM 119, 120 and
+    # 126 were missing from it, so Play 6 was free to move guests that were
+    # actually meant to stay put, e.g. VM 119 pinned to PVE1-dell.)
+    non_migratable_vms: *non_migratable_vms_map
+    pinned_vmids: "{{ non_migratable_vms.values() | list | flatten }}"
+ 
   tasks:
     - name: "6 | Write rebalance script to disk"
       ansible.builtin.copy:
@@ -670,28 +773,28 @@
         mode: "0700"
         content: |
           import subprocess, json, re, sys
-
+ 
           CPU_W     = float(sys.argv[1])
           RAM_W     = float(sys.argv[2])
           THRESHOLD = float(sys.argv[3])
           PINNED    = set(sys.argv[4].split(",")) if sys.argv[4] else set()
           RULES_CFG = "/etc/pve/ha/rules.cfg"
-
+ 
           def pvesh(path):
               raw = subprocess.check_output(
                   ["pvesh", "get", path, "--type", "vm", "--output-format", "json"],
                   stderr=subprocess.DEVNULL, text=True)
               return json.loads(raw)
-
+ 
           try:
               rules_text = open(RULES_CFG).read()
           except FileNotFoundError:
               rules_text = ""
-
+ 
           blocks = re.split(r'\n(?=\S)', rules_text.strip())
           node_pinned = {}
           neg_peers   = {}
-
+ 
           for block in blocks:
               lines = [l.strip() for l in block.strip().splitlines()]
               if not lines:
@@ -702,7 +805,7 @@
                   parts = l.split(None, 1)
                   if len(parts) == 2:
                       props[parts[0]] = parts[1]
-
+ 
               if header.startswith("node-affinity:") and props.get("strict", "0") == "1":
                   for sid in props.get("resources", "").split(","):
                       sid = sid.strip()
@@ -710,7 +813,7 @@
                           vmid = sid.split(":")[1]
                           allowed = set(n.strip() for n in props.get("nodes", "").split(","))
                           node_pinned[vmid] = allowed
-
+ 
               if header.startswith("resource-affinity:") and props.get("affinity") == "negative":
                   members    = [s.strip() for s in props.get("resources", "").split(",")]
                   member_ids = [s.split(":")[1] for s in members if s.startswith("vm:")]
@@ -718,10 +821,10 @@
                       if vmid not in neg_peers:
                           neg_peers[vmid] = set()
                       neg_peers[vmid].update(p for p in member_ids if p != vmid)
-
+ 
           cluster_vms = pvesh("/cluster/resources")
           nodes = sorted(set(v["node"] for v in cluster_vms if "node" in v))
-
+ 
           vm_info = {}
           for v in cluster_vms:
               if v.get("type") != "qemu" or v.get("status") != "running":
@@ -734,17 +837,17 @@
                   "cpus":   v.get("maxcpu", 1),
                   "ram_gb": v.get("maxmem", 1073741824) / 1073741824,
               }
-
+ 
           def score(vm):
               return vm["cpus"] * CPU_W + vm["ram_gb"] * RAM_W
-
+ 
           moves       = []
           moved_vmids = set()   # each VM moves at most once per run — prevents
                                  # the same guest flip-flopping back and forth
                                  # when there isn't enough granularity among
                                  # running VMs to hit THRESHOLD exactly.
           MAX_MOVES = 50   # was 20 — more room to fully flatten a skewed cluster
-
+ 
           for _ in range(MAX_MOVES):
               node_score = {n: 0.0 for n in nodes}
               node_vms   = {n: [] for n in nodes}
@@ -752,18 +855,18 @@
                   s = score(info)
                   node_score[info["node"]] += s
                   node_vms[info["node"]].append((vmid, s))
-
+ 
               total = sum(node_score.values())
               if total == 0:
                   break
-
+ 
               max_node = max(node_score, key=node_score.get)
               min_node = min(node_score, key=node_score.get)
               spread   = (node_score[max_node] - node_score[min_node]) / total
-
+ 
               if spread < THRESHOLD:
                   break
-
+ 
               candidates = sorted(node_vms[max_node], key=lambda x: x[1], reverse=True)
               moved = False
               for vmid, _ in candidates:
@@ -778,7 +881,7 @@
                   moved_vmids.add(vmid)
                   moved = True
                   break
-
+ 
               if not moved:
                   # Either every VM on the most-loaded node is pinned by
                   # anti-affinity, or every movable VM here has already been
@@ -787,9 +890,9 @@
                   # making real progress, so stop here even if spread is still
                   # above THRESHOLD.
                   break
-
+ 
           print(json.dumps(moves))
-
+ 
     - name: "6 | Compute rebalance move plan"
       ansible.builtin.command: >
         python3 /tmp/pve_rebalance.py
@@ -799,11 +902,11 @@
         {{ pinned_vmids | join(',') }}
       register: rebalance_plan_raw
       changed_when: false
-
+ 
     - name: "6 | Parse move plan"
       ansible.builtin.set_fact:
         rebalance_moves: "{{ rebalance_plan_raw.stdout | from_json }}"
-
+ 
     - name: "6 | Show rebalance plan"
       ansible.builtin.debug:
         msg: >-
@@ -815,7 +918,7 @@
             VM {{ m.vmid }}: {{ m.from }} → {{ m.to }}
           {% endfor %}
           {% endif %}
-
+ 
     # qm migrate is a LOCAL command — it must run on the node that currently
     # owns the VM (item.from), never from a fixed "coordinator" node. Without
     # delegate_to here, every migration was issued from proxmox_nodes[0]
@@ -831,7 +934,7 @@
       when: rebalance_moves | length > 0
       delegate_to: "{{ item.from }}"
       register: rebalance_migrate_result
-
+ 
     - name: "6 | Pause between migrations to let cluster settle"
       ansible.builtin.pause:
         seconds: "{{ migrate_settle_seconds }}"
@@ -839,7 +942,7 @@
       loop_control:
         label: "Settling after VM {{ item.vmid }}"
       when: rebalance_moves | length > 0
-
+ 
     - name: "6 | Rebalance complete — final node load summary"
       ansible.builtin.shell: |
         python3 - <<'PYEOF'
@@ -860,11 +963,11 @@
         PYEOF
       register: final_summary
       changed_when: false
-
+ 
     - name: "6 | Show final load summary"
       ansible.builtin.debug:
         msg: "{{ final_summary.stdout_lines }}"
-
+ 
 ##############################################################################
 # PLAY 7 – Re-apply PVE sensors mod on all nodes after patching
 ##############################################################################
@@ -873,7 +976,7 @@
   gather_facts: false
   become: true
   serial: 1
-
+ 
   tasks:
     - name: "7 | Uninstall existing sensors mod (ignore if not installed)"
       ansible.builtin.shell: |
@@ -881,11 +984,11 @@
       register: sensors_uninstall
       failed_when: false
       changed_when: "'Uninstalling' in sensors_uninstall.stdout"
-
+ 
     - name: "7 | Show uninstall output"
       ansible.builtin.debug:
         var: sensors_uninstall.stdout_lines
-
+ 
     - name: "7 | Re-install sensors mod"
       ansible.builtin.shell: |
         printf 'Y\nY\nY\nc\nN\n' | timeout 60 bash /root/pve-mod-gui-sensors.sh install
@@ -893,7 +996,13 @@
       failed_when: >
         sensors_install.rc != 0 and
         'already installed' not in sensors_install.stdout
-
+ 
     - name: "7 | Show install output"
       ansible.builtin.debug:
         var: sensors_install.stdout_lines
+ 
+
+
+
+
+1Password menu is available. Press down arrow to select.
