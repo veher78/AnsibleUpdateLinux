@@ -34,6 +34,13 @@
 #     instead of Play 6 keeping its own separate, driftable copy. This fixes
 #     a real bug where VM 119 (pinned to PVE1-dell) was missing from Play 6's
 #     old hardcoded pinned list and got rebalanced away despite being pinned.
+#   - Play 6: LXC containers are now included in rebalancing, not just QEMU
+#     VMs. Previously the script explicitly filtered to type=="qemu", so
+#     containers were invisible to both the load score and the move plan.
+#     Anti-affinity parsing now also recognises "ct:" resource-ids in
+#     rules.cfg (was "vm:" only), and the move executor picks the right
+#     command per guest type (qm migrate --online for VMs, pct migrate
+#     --restart for containers).
 # =============================================================================
 
 ##############################################################################
@@ -640,15 +647,17 @@
 
 
 ##############################################################################
-# PLAY 6 – Cluster load rebalancing (CPU + RAM weighted)
+# PLAY 6 – Cluster load rebalancing (CPU + RAM weighted, VMs AND LXC CTs)
 #
-# Runs automatically after patching to spread VMs evenly across all 3 nodes.
+# Runs automatically after patching to spread guests evenly across all 3
+# nodes. Covers both QEMU VMs and LXC containers — see CHANGELOG above.
 #
 # Scope:
-#   - Only considers RUNNING VMs
-#   - Excludes VMs pinned by node-affinity strict rules (rules.cfg)
-#   - Excludes VMs in the non_migratable_vms map (aliased from Play 4 — see
-#     pinned_vmids below; this is the single source of truth, not a copy)
+#   - Only considers RUNNING VMs and CTs
+#   - Excludes guests pinned by node-affinity strict rules (rules.cfg,
+#     "vm:" and "ct:" resource-ids)
+#   - Excludes guests in the non_migratable_vms map (aliased from Play 4 —
+#     see pinned_vmids below; this is the single source of truth, not a copy)
 #   - Respects resource-affinity negative rules when choosing destination
 #
 # Load metric: weighted score = (vCPUs * cpu_weight) + (RAM_GB * ram_weight)
@@ -737,14 +746,17 @@
               if header.startswith("node-affinity:") and props.get("strict", "0") == "1":
                   for sid in props.get("resources", "").split(","):
                       sid = sid.strip()
-                      if sid.startswith("vm:"):
-                          vmid = sid.split(":")[1]
+                      # "vm:" = QEMU VM, "ct:" = LXC container — both are
+                      # valid HA resource-id prefixes in rules.cfg.
+                      if sid.startswith("vm:") or sid.startswith("ct:"):
+                          vmid = sid.split(":", 1)[1]
                           allowed = set(n.strip() for n in props.get("nodes", "").split(","))
                           node_pinned[vmid] = allowed
 
               if header.startswith("resource-affinity:") and props.get("affinity") == "negative":
                   members    = [s.strip() for s in props.get("resources", "").split(",")]
-                  member_ids = [s.split(":")[1] for s in members if s.startswith("vm:")]
+                  member_ids = [s.split(":", 1)[1] for s in members
+                                if s.startswith("vm:") or s.startswith("ct:")]
                   for vmid in member_ids:
                       if vmid not in neg_peers:
                           neg_peers[vmid] = set()
@@ -753,15 +765,23 @@
           cluster_vms = pvesh("/cluster/resources")
           nodes = sorted(set(v["node"] for v in cluster_vms if "node" in v))
 
+          # "vm" (--type vm) returns BOTH qemu VMs and lxc containers, tagged
+          # via the per-entry "type" field ("qemu" or "lxc"). Previously this
+          # loop only kept type=="qemu", silently dropping every LXC
+          # container from load scoring and rebalancing — CTs were never
+          # touched. Both types are now included and tracked so the move
+          # executor below can issue the right migrate command per guest.
           vm_info = {}
           for v in cluster_vms:
-              if v.get("type") != "qemu" or v.get("status") != "running":
+              vtype = v.get("type")
+              if vtype not in ("qemu", "lxc") or v.get("status") != "running":
                   continue
               vmid = str(v["vmid"])
               if vmid in PINNED or vmid in node_pinned:
                   continue
               vm_info[vmid] = {
                   "node":   v["node"],
+                  "type":   vtype,
                   "cpus":   v.get("maxcpu", 1),
                   "ram_gb": v.get("maxmem", 1073741824) / 1073741824,
               }
@@ -804,7 +824,8 @@
                   peers_on_min = [p for p in peers if vm_info.get(p, {}).get("node") == min_node]
                   if peers_on_min:
                       continue
-                  moves.append({"vmid": vmid, "from": max_node, "to": min_node})
+                  moves.append({"vmid": vmid, "from": max_node, "to": min_node,
+                                "type": vm_info[vmid]["type"]})
                   vm_info[vmid]["node"] = min_node
                   moved_vmids.add(vmid)
                   moved = True
@@ -843,22 +864,30 @@
           {% else %}
           Planned {{ rebalance_moves | length }} move(s):
           {% for m in rebalance_moves %}
-            VM {{ m.vmid }}: {{ m.from }} → {{ m.to }}
+            {{ 'VM' if m.type == 'qemu' else 'CT' }} {{ m.vmid }}: {{ m.from }} → {{ m.to }}
           {% endfor %}
           {% endif %}
 
-    # qm migrate is a LOCAL command — it must run on the node that currently
-    # owns the VM (item.from), never from a fixed "coordinator" node. Without
-    # delegate_to here, every migration was issued from proxmox_nodes[0]
-    # regardless of where the VM actually lives, which fails immediately
-    # ("target is local node" when from==self, "config does not exist" when
-    # the VM isn't local to the executing node).
-    - name: "6 | Execute VM migrations"
+    # qm migrate / pct migrate are LOCAL commands — they must run on the node
+    # that currently owns the guest (item.from), never from a fixed
+    # "coordinator" node. Without delegate_to here, every migration was
+    # issued from proxmox_nodes[0] regardless of where the guest actually
+    # lives, which fails immediately ("target is local node" when
+    # from==self, "config does not exist" when the guest isn't local to the
+    # executing node).
+    #
+    # Command differs by guest type: qm migrate supports --online (true live
+    # migration) for QEMU VMs; pct migrate uses --restart for LXC containers
+    # (stop on source, start on target — matches the CT migration approach
+    # already used in Play 4's step 4-C).
+    - name: "6 | Execute VM/CT migrations"
       ansible.builtin.command: >
-        qm migrate {{ item.vmid }} {{ item.to }} --online
+        {{ 'qm migrate' if item.type == 'qemu' else 'pct migrate' }}
+        {{ item.vmid }} {{ item.to }}
+        {{ '--online' if item.type == 'qemu' else '--restart' }}
       loop: "{{ rebalance_moves }}"
       loop_control:
-        label: "VM {{ item.vmid }}: {{ item.from }} → {{ item.to }}"
+        label: "{{ 'VM' if item.type == 'qemu' else 'CT' }} {{ item.vmid }}: {{ item.from }} → {{ item.to }}"
       when: rebalance_moves | length > 0
       delegate_to: "{{ item.from }}"
       register: rebalance_migrate_result
@@ -868,7 +897,7 @@
         seconds: "{{ migrate_settle_seconds }}"
       loop: "{{ rebalance_moves }}"
       loop_control:
-        label: "Settling after VM {{ item.vmid }}"
+        label: "Settling after {{ 'VM' if item.type == 'qemu' else 'CT' }} {{ item.vmid }}"
       when: rebalance_moves | length > 0
 
     - name: "6 | Rebalance complete — final node load summary"
@@ -876,18 +905,19 @@
         python3 - <<'PYEOF'
         import subprocess, json
         cluster_vms = json.loads(subprocess.check_output(
-            ["pvesh", "get", "/cluster/resources", "--output-format", "json"],
+            ["pvesh", "get", "/cluster/resources", "--type", "vm", "--output-format", "json"],
             stderr=subprocess.DEVNULL, text=True))
+        cpu_w, ram_w = {{ cpu_weight }}, {{ ram_weight }}
         node_score = {}
         node_count = {}
         for v in cluster_vms:
-            if v.get("type") != "qemu" or v.get("status") != "running":
+            if v.get("type") not in ("qemu", "lxc") or v.get("status") != "running":
                 continue
             n = v["node"]
-            node_score[n] = node_score.get(n, 0) + v.get("maxcpu", 1) + v.get("maxmem", 1073741824) / 1073741824
+            node_score[n] = node_score.get(n, 0) + v.get("maxcpu", 1) * cpu_w + (v.get("maxmem", 1073741824) / 1073741824) * ram_w
             node_count[n] = node_count.get(n, 0) + 1
         for n in sorted(node_score):
-            print(f"  {n}: {node_count[n]} VMs, weighted score={node_score[n]:.1f}")
+            print(f"  {n}: {node_count[n]} guests (VMs+CTs), weighted score={node_score[n]:.1f}")
         PYEOF
       register: final_summary
       changed_when: false
