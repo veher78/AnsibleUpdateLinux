@@ -1,5 +1,5 @@
 ---
-- name: Upgrade Ubuntu towards 26.04 LTS and boot a verified patched kernel
+- name: Upgrade Ubuntu systems and LXC containers towards 26.04 LTS
   hosts: all
   become: true
   serial: 1
@@ -14,21 +14,8 @@
     _ubuntu_upgrade_defaults:
       ubuntu_target_release: '26.04'
       ubuntu_release_upgrade: true
-      ubuntu_allow_proposed_kernel: true
       ubuntu_upgrade_timeout: 14400
       ubuntu_reboot_timeout: 1800
-      # Set per host if automatic detection finds more than one image meta-package.
-      ubuntu_kernel_meta: ''
-      # Add vendor-confirmed minima for other source packages here, keyed by codename.
-      ubuntu_kernel_fixed_versions:
-        jammy:
-          linux: '5.15.0-203.213'
-          linux-hwe-6.8: '6.8.0-149.149~22.04.1'
-        noble:
-          linux: '6.8.0-149.149'
-          linux-hwe-7.0: '7.0.0-43.43~24.04.1'
-        resolute:
-          linux: '7.0.0-43.43'
       ubuntu_config_allowlist:
         - /etc/cron.d/e2scrub_all
         - /etc/apt/apt.conf.d/20auto-upgrades
@@ -38,12 +25,9 @@
       ansible.builtin.set_fact:
         ubuntu_target_release: '{{ ubuntu_target_release | default(_ubuntu_upgrade_defaults.ubuntu_target_release) }}'
         ubuntu_release_upgrade: '{{ ubuntu_release_upgrade | default(_ubuntu_upgrade_defaults.ubuntu_release_upgrade) }}'
-        ubuntu_allow_proposed_kernel: '{{ ubuntu_allow_proposed_kernel | default(_ubuntu_upgrade_defaults.ubuntu_allow_proposed_kernel) }}'
         ubuntu_upgrade_timeout: '{{ ubuntu_upgrade_timeout | default(_ubuntu_upgrade_defaults.ubuntu_upgrade_timeout) }}'
         ubuntu_reboot_timeout: '{{ ubuntu_reboot_timeout | default(_ubuntu_upgrade_defaults.ubuntu_reboot_timeout) }}'
-        ubuntu_kernel_meta: '{{ ubuntu_kernel_meta | default(_ubuntu_upgrade_defaults.ubuntu_kernel_meta) }}'
         ubuntu_config_allowlist: '{{ ubuntu_config_allowlist | default(_ubuntu_upgrade_defaults.ubuntu_config_allowlist) }}'
-        ubuntu_kernel_fixed_versions: '{{ _ubuntu_upgrade_defaults.ubuntu_kernel_fixed_versions | combine(ubuntu_kernel_fixed_versions | default({}), recursive=true) }}'
 
     - name: Require an actual supported Ubuntu LTS host
       ansible.builtin.assert:
@@ -51,12 +35,13 @@
           - ansible_facts.distribution == 'Ubuntu'
           - ansible_facts.distribution_version in ['22.04', '24.04', '26.04']
           - ubuntu_target_release == '26.04'
-          - ansible_facts.virtualization_type not in ['docker', 'podman', 'lxc', 'container', 'wsl', 'wsl2']
+          - ansible_facts.service_mgr == 'systemd'
+          - ansible_facts.virtualization_type not in ['docker', 'podman', 'container', 'wsl', 'wsl2']
           - "'microsoft' not in (ansible_facts.kernel | lower)"
           - not ansible_check_mode
         fail_msg: >-
-          This play supports Ubuntu 22.04/24.04/26.04 VMs or physical hosts,
-          targeting 26.04 LTS. Containers, WSL and check mode are unsupported.
+          This play supports Ubuntu 22.04/24.04/26.04 in LXC containers, VMs or physical hosts,
+          targeting 26.04 LTS. Systemd is required; Docker/Podman, WSL and check mode are unsupported.
 
     - name: Check package database before modifying packages
       ansible.builtin.command: dpkg --audit
@@ -115,16 +100,14 @@
         group: root
         mode: '0700'
 
-    - name: Write configuration and kernel policy
+    - name: Write configuration policy
       ansible.builtin.copy:
         dest: /var/lib/ansible-ubuntu-upgrade/policy.json
         owner: root
         group: root
         mode: '0600'
         content: >-
-          {{ {'allowlist': ubuntu_config_allowlist,
-              'fixed_versions': ubuntu_kernel_fixed_versions,
-              'kernel_meta': ubuntu_kernel_meta} | to_nice_json }}
+          {{ {'allowlist': ubuntu_config_allowlist} | to_nice_json }}
 
     - name: Back up access and upgrade configuration
       ansible.builtin.command:
@@ -160,14 +143,14 @@
               APT::Get::Always-Include-Phased-Updates "true";
           register: temporary_policy
 
-        - name: Fully update current Ubuntu release without autoremoving fallback kernels
+        - name: Fully update current Ubuntu release
           ansible.builtin.apt:
             update_cache: true
             upgrade: dist
             dpkg_options: force-confold
             lock_timeout: 600
 
-        - name: Install upgrade and kernel inspection dependencies
+        - name: Install release upgrade dependencies
           ansible.builtin.apt:
             name:
               - ubuntu-release-upgrader-core
@@ -197,9 +180,6 @@
         - name: Refresh facts after possible release change
           ansible.builtin.setup:
 
-        - name: Apply and verify patched kernel on the resulting release
-          ansible.builtin.include_tasks: tasks/patched-kernel.yml
-
         - name: Final package database check
           ansible.builtin.command: dpkg --audit
           register: final_audit
@@ -209,7 +189,8 @@
         - name: Report final state
           ansible.builtin.debug:
             msg:
-              - 'Ubuntu {{ ansible_facts.distribution_version }}; running kernel {{ kernel_verification.stdout }}'
+              - 'Ubuntu {{ ansible_facts.distribution_version }}; virtualization {{ ansible_facts.virtualization_type }}'
+              - 'No separate kernel patching or kernel vulnerability verification is performed.'
               - >-
                 {{ 'Target 26.04 LTS reached.' if ansible_facts.distribution_version == ubuntu_target_release
                    else 'Target not yet reached. Review the release offer/logs; rerun for the next supported LTS step.' }}
