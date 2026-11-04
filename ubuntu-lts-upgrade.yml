@@ -326,7 +326,7 @@
             - name: Verify the offered release cannot exceed the target
               ansible.builtin.assert:
                 that:
-                  - release_offer.stdout is search('New release .(24\.04|26\.04)(\.\d+)?. available')
+                  - release_offer.stdout is search("(?m)^New release '(24[.]04|26[.]04)([.][0-9]+)?( LTS)?' available[.]$")
                 fail_msg: 'Unexpected release offer; refusing an unattended upgrade: {{ release_offer.stdout }}'
               when: release_offer.rc == 0
 
