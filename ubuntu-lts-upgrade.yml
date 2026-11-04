@@ -94,7 +94,116 @@
 
     - name: Install runbook helper
       ansible.builtin.copy:
-        src: files/ubuntu_upgrade.py
+        content: |
+          #!/usr/bin/python3
+          """Local helper for the Ubuntu LTS runbook; never runs a release upgrade itself."""
+          import datetime
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import sys
+          import tarfile
+          
+          ROOT = Path('/var/lib/ansible-ubuntu-upgrade')
+          POLICY = ROOT / 'policy.json'
+          BASELINE = ROOT / 'config-baseline.json'
+          SUFFIXES = ('.dpkg-dist', '.ucf-dist', '.ucf-new')
+          # Deliberately narrow: arbitrary paths, particularly SSH, cannot be allowlisted.
+          ALLOWED = {
+              '/etc/cron.d/e2scrub_all',
+              '/etc/apt/apt.conf.d/20auto-upgrades',
+              '/etc/apt/apt.conf.d/50unattended-upgrades',
+          }
+          
+          
+          def policy():
+              return json.loads(POLICY.read_text())
+          
+          
+          def digest(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+          
+          
+          def variants(paths):
+              return {p + suffix: digest(Path(p + suffix)) for p in paths for suffix in SUFFIXES}
+          
+          
+          def backup():
+              paths = policy()['allowlist']
+              if not set(paths) <= ALLOWED:
+                  raise RuntimeError('Configuration allowlist contains an unapproved path')
+              stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+              archive = ROOT / ('configuration-' + stamp + '.tar.gz')
+              with tarfile.open(archive, 'w:gz') as output:
+                  for name in ('/etc/ssh', '/etc/apt', '/etc/update-manager',
+                               '/etc/netplan', '/etc/cron.d/e2scrub_all'):
+                      if Path(name).exists():
+                          output.add(name, arcname=name.lstrip('/'))
+              os.chmod(archive, 0o600)
+              BASELINE.write_text(json.dumps(variants(paths)))
+              print(json.dumps({'backup': str(archive)}))
+          
+          
+          def configs():
+              paths = policy()['allowlist']
+              if not set(paths) <= ALLOWED:
+                  raise RuntimeError('Configuration allowlist contains an unapproved path')
+              before = json.loads(BASELINE.read_text())
+              changed = []
+              for name in paths:
+                  target = Path(name)
+                  fresh = [Path(name + s) for s in SUFFIXES
+                           if digest(Path(name + s)) is not None
+                           and digest(Path(name + s)) != before.get(name + s)]
+                  if len(fresh) > 1:
+                      raise RuntimeError('Multiple new configuration variants for ' + name)
+                  if not fresh:
+                      continue
+                  incoming = fresh[0]
+                  if target.is_symlink() or incoming.is_symlink():
+                      raise RuntimeError('Refusing a symlink in the configuration allowlist')
+                  if target.exists():
+                      stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+                      shutil.copy2(target, ROOT / (target.name + '.' + stamp + '.bak'))
+                  # The new file carries the package's ownership/mode; rename is atomic.
+                  incoming.replace(target)
+                  changed.append(name)
+              BASELINE.write_text(json.dumps(variants(paths)))
+              if changed:
+                  subprocess.run(['systemctl', 'daemon-reload'], check=True)
+              print(json.dumps({'changed': bool(changed), 'files': changed}))
+          
+          
+          def boot_token():
+              # The host boot ID alone may stay unchanged when an LXC container restarts.
+              # Field 22 is PID 1's start time; split after comm, which may contain spaces.
+              boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+              fields = Path('/proc/1/stat').read_text().rsplit(') ', 1)[1].split()
+              return boot_id + ':' + fields[19]
+          
+          
+          def main():
+              action = sys.argv[1]
+              if action == 'backup':
+                  backup()
+              elif action == 'configs':
+                  configs()
+              elif action == 'boot-token':
+                  print(boot_token())
+              else:
+                  raise RuntimeError('Unknown action: ' + action)
+              return 0
+          
+          
+          if __name__ == '__main__':
+              try:
+                  sys.exit(main())
+              except Exception as error:
+                  print(str(error), file=sys.stderr)
+                  sys.exit(1)
         dest: /var/lib/ansible-ubuntu-upgrade/helper.py
         owner: root
         group: root
@@ -164,18 +273,105 @@
           register: config_updates
           changed_when: (config_updates.stdout | from_json).changed
 
-        - name: Reboot current release first if required
-          ansible.builtin.include_tasks: tasks/reboot-if-required.yml
+        - name: Check reboot marker
+          ansible.builtin.stat:
+            path: /var/run/reboot-required
+          register: reboot_required
 
-        - name: Follow supported LTS steps towards 26.04
-          ansible.builtin.include_tasks: tasks/release-upgrade.yml
-          loop: [1, 2]
-          loop_control:
-            loop_var: lts_step
+        - name: Validate SSH configuration before reboot
+          ansible.builtin.command: /usr/sbin/sshd -t
+          changed_when: false
+          when: reboot_required.stat.exists
+
+        - name: Reboot and wait for Ansible access
+          ansible.builtin.reboot:
+            msg: Restarting after Ubuntu package updates
+            reboot_timeout: '{{ ubuntu_reboot_timeout }}'
+            boot_time_command: python3 /var/lib/ansible-ubuntu-upgrade/helper.py boot-token
+          when: reboot_required.stat.exists
+
+        # Reuse the same guarded block for up to two sequential LTS steps.
+        - &ubuntu_lts_step
+          name: Perform a supported LTS step only while below target
           when:
             - ubuntu_release_upgrade | bool
             - ansible_facts.distribution_version is version(ubuntu_target_release, '<')
             - not (ubuntu_no_release_offer | default(false))
+          block:
+            - name: Select LTS release offers only
+              ansible.builtin.lineinfile:
+                path: /etc/update-manager/release-upgrades
+                regexp: '^Prompt='
+                line: Prompt=lts
+                create: false
+                backup: true
+
+            - name: Check for a supported release offer
+              ansible.builtin.command: do-release-upgrade --check-dist-upgrade-only
+              register: release_offer
+              changed_when: false
+              failed_when: >-
+                release_offer.rc not in [0, 1] or
+                (release_offer.rc == 1 and 'No new release found' not in release_offer.stdout)
+
+            - name: Remember when Ubuntu offers no further LTS upgrade
+              ansible.builtin.set_fact:
+                ubuntu_no_release_offer: true
+              when: release_offer.rc == 1
+
+            - name: Show release offer
+              ansible.builtin.debug:
+                var: release_offer.stdout
+
+            - name: Verify the offered release cannot exceed the target
+              ansible.builtin.assert:
+                that:
+                  - release_offer.stdout is search('New release .(24\.04|26\.04)(\.\d+)?. available')
+                fail_msg: 'Unexpected release offer; refusing an unattended upgrade: {{ release_offer.stdout }}'
+              when: release_offer.rc == 0
+
+            - name: Run release upgrade with preserved configuration and persistent logs
+              ansible.builtin.shell: >-
+                exec do-release-upgrade --mode=server --frontend=DistUpgradeViewNonInteractive
+                > /var/log/ansible-do-release-upgrade.log 2>&1
+              args:
+                executable: /bin/sh
+              async: '{{ ubuntu_upgrade_timeout }}'
+              poll: 30
+              when: release_offer.rc == 0
+              register: release_result
+
+            - name: Verify a successful upgrade actually changed the installed release
+              ansible.builtin.command: lsb_release -rs
+              register: installed_release
+              changed_when: false
+              failed_when: >-
+                installed_release.rc != 0 or
+                installed_release.stdout | trim == ansible_facts.distribution_version
+              when: release_offer.rc == 0
+
+            - name: Accept allowlisted configs after release upgrade
+              ansible.builtin.command: python3 /var/lib/ansible-ubuntu-upgrade/helper.py configs
+              register: release_config_updates
+              changed_when: (release_config_updates.stdout | from_json).changed
+              when: release_offer.rc == 0
+
+            - name: Validate SSH config before rebooting into the new release
+              ansible.builtin.command: /usr/sbin/sshd -t
+              changed_when: false
+
+            - name: Reboot after completed release upgrade
+              ansible.builtin.reboot:
+                reboot_timeout: '{{ ubuntu_reboot_timeout }}'
+                boot_time_command: python3 /var/lib/ansible-ubuntu-upgrade/helper.py boot-token
+                msg: Rebooting after Ubuntu LTS release upgrade
+              when: release_offer.rc == 0
+
+
+            - name: Refresh facts for the next LTS step
+              ansible.builtin.setup:
+
+        - *ubuntu_lts_step
 
         - name: Refresh facts after possible release change
           ansible.builtin.setup:
