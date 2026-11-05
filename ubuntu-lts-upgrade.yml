@@ -11,9 +11,12 @@
     NEEDRESTART_MODE: a
     LC_ALL: C
   vars:
+    # Use the system Python path across LTS interpreter replacements.
+    ansible_python_interpreter: /usr/bin/python3
     _ubuntu_upgrade_defaults:
       ubuntu_target_release: '26.04'
       ubuntu_release_upgrade: true
+      ubuntu_force_reboot: false
       ubuntu_upgrade_timeout: 14400
       ubuntu_reboot_timeout: 1800
       ubuntu_config_allowlist:
@@ -25,6 +28,7 @@
       ansible.builtin.set_fact:
         ubuntu_target_release: '{{ ubuntu_target_release | default(_ubuntu_upgrade_defaults.ubuntu_target_release) }}'
         ubuntu_release_upgrade: '{{ ubuntu_release_upgrade | default(_ubuntu_upgrade_defaults.ubuntu_release_upgrade) }}'
+        ubuntu_force_reboot: '{{ ubuntu_force_reboot | default(_ubuntu_upgrade_defaults.ubuntu_force_reboot) }}'
         ubuntu_upgrade_timeout: '{{ ubuntu_upgrade_timeout | default(_ubuntu_upgrade_defaults.ubuntu_upgrade_timeout) }}'
         ubuntu_reboot_timeout: '{{ ubuntu_reboot_timeout | default(_ubuntu_upgrade_defaults.ubuntu_reboot_timeout) }}'
         ubuntu_config_allowlist: '{{ ubuntu_config_allowlist | default(_ubuntu_upgrade_defaults.ubuntu_config_allowlist) }}'
@@ -54,6 +58,14 @@
       register: held_packages
       changed_when: false
       failed_when: held_packages.rc != 0 or held_packages.stdout | trim | length > 0
+
+    - name: Ensure SSH runtime directory exists before standalone validation
+      ansible.builtin.file:
+        path: /run/sshd
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
 
     - name: Validate SSH configuration before starting
       ansible.builtin.command: /usr/sbin/sshd -t
@@ -278,17 +290,36 @@
             path: /var/run/reboot-required
           register: reboot_required
 
+        - name: Check for a completed LTS upgrade waiting for restart
+          ansible.builtin.stat:
+            path: /var/lib/ansible-ubuntu-upgrade/release-upgrade-reboot-pending
+          register: release_reboot_pending
+
+        - name: Ensure SSH runtime directory exists before standalone validation
+          ansible.builtin.file:
+            path: /run/sshd
+            state: directory
+            owner: root
+            group: root
+            mode: '0755'
+
         - name: Validate SSH configuration before reboot
           ansible.builtin.command: /usr/sbin/sshd -t
           changed_when: false
-          when: reboot_required.stat.exists
+          when: reboot_required.stat.exists or release_reboot_pending.stat.exists or ubuntu_force_reboot | bool
 
         - name: Reboot and wait for Ansible access
           ansible.builtin.reboot:
             msg: Restarting after Ubuntu package updates
             reboot_timeout: '{{ ubuntu_reboot_timeout }}'
             boot_time_command: python3 /var/lib/ansible-ubuntu-upgrade/helper.py boot-token
-          when: reboot_required.stat.exists
+          when: reboot_required.stat.exists or release_reboot_pending.stat.exists or ubuntu_force_reboot | bool
+
+        - name: Clear pending release restart after successful reboot
+          ansible.builtin.file:
+            path: /var/lib/ansible-ubuntu-upgrade/release-upgrade-reboot-pending
+            state: absent
+          when: reboot_required.stat.exists or release_reboot_pending.stat.exists or ubuntu_force_reboot | bool
 
         # Reuse the same guarded block for up to two sequential LTS steps.
         - &ubuntu_lts_step
@@ -350,11 +381,28 @@
                 installed_release.stdout | trim == ansible_facts.distribution_version
               when: release_offer.rc == 0
 
+            - name: Remember that the completed LTS upgrade still needs a restart
+              ansible.builtin.copy:
+                dest: /var/lib/ansible-ubuntu-upgrade/release-upgrade-reboot-pending
+                content: 'The LTS upgrade completed; reboot and verify access before clearing this marker.'
+                owner: root
+                group: root
+                mode: '0600'
+              when: release_offer.rc == 0
+
             - name: Accept allowlisted configs after release upgrade
               ansible.builtin.command: python3 /var/lib/ansible-ubuntu-upgrade/helper.py configs
               register: release_config_updates
               changed_when: (release_config_updates.stdout | from_json).changed
               when: release_offer.rc == 0
+
+            - name: Ensure SSH runtime directory exists before standalone validation
+              ansible.builtin.file:
+                path: /run/sshd
+                state: directory
+                owner: root
+                group: root
+                mode: '0755'
 
             - name: Validate SSH config before rebooting into the new release
               ansible.builtin.command: /usr/sbin/sshd -t
@@ -367,6 +415,12 @@
                 msg: Rebooting after Ubuntu LTS release upgrade
               when: release_offer.rc == 0
 
+
+            - name: Clear the completed release upgrade restart marker
+              ansible.builtin.file:
+                path: /var/lib/ansible-ubuntu-upgrade/release-upgrade-reboot-pending
+                state: absent
+              when: release_offer.rc == 0
 
             - name: Refresh facts for the next LTS step
               ansible.builtin.setup:
