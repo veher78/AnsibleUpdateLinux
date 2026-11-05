@@ -1,0 +1,43 @@
+---
+- name: Upgrade the Ansible/Semaphore host itself
+  hosts: local
+  connection: local
+  become: yes
+  gather_facts: yes
+
+  vars:
+    reboot_after_upgrade: false   # set to true only if you accept the job being cut off by the reboot
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Upgrade all packages
+      apt:
+        upgrade: dist
+        autoremove: yes
+        autoclean: yes
+      register: upgrade_result
+
+    - name: Show what changed
+      debug:
+        msg: "Upgrade changed packages: {{ upgrade_result.changed }}"
+
+    - name: Check if reboot is required
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Report reboot status
+      debug:
+        msg: "Reboot required: {{ reboot_required.stat.exists }}"
+
+    - name: Reboot if required and allowed
+      reboot:
+        msg: "Rebooting Semaphore host after upgrade"
+        reboot_timeout: 600
+      when:
+        - reboot_required.stat.exists
+        - reboot_after_upgrade | bool
